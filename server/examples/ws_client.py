@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# MIT License
+# Copyright (c) 2026 Tz-WIND/Lex_q
+#
+# SPDX-License-Identifier: MIT
 """
 Example consumer for the 8111-for-WoWS server.
 

@@ -1,3 +1,8 @@
+# MIT License
+# Copyright (c) 2026 Tz-WIND/Lex_q
+#
+# SPDX-License-Identifier: MIT
+
 API_VERSION = 'API_v1.0'
 MOD_NAME = 'WowsExtractor'
 MOD_VERSION = '0.1.0'
