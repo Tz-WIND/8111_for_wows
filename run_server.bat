@@ -13,7 +13,7 @@ REM     run_server.bat --state-file "D:\...\WowsExtractor\state.json"
 REM ============================================================
 
 setlocal
-set "GAME_DIR=D:\Games\World_of_Warships"
+set "GAME_DIR=E:\World_of_Warships"
 set "PORT=8111"
 
 cd /d "%~dp0"

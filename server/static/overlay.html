@@ -33,6 +33,7 @@
   <div class="row"><span>Map</span><span id="mapName">-</span></div>
   <div class="row"><span>Mode</span><span id="battleType">-</span></div>
   <div class="row"><span>Ships</span><span id="shipCount">0</span></div>
+  <div class="row"><span>Last-seen</span><span id="ghostCount">0</span></div>
   <div class="row"><span>Bounds</span><span id="boundsMode">auto-fit</span></div>
   <div id="scoreLine"></div>
   <div id="status" class="bad">connecting&hellip;</div>
@@ -42,6 +43,7 @@
   <span class="dot" style="background:var(--ally)"></span>Ally
   <span class="dot" style="background:var(--enemy)"></span>Enemy
   <span class="dot" style="background:var(--self)"></span>You
+  <span class="dot" style="background:transparent;border:1px dashed #9aa7ad"></span>Last seen
 </div>
 
 <script>
@@ -50,6 +52,7 @@ const canvas = document.getElementById("map");
 const ctx = canvas.getContext("2d");
 let snap = null;                    // latest /all snapshot
 let fit = null;                     // smoothed auto-fit bounds {minX,maxX,minZ,maxZ}
+const GHOST_MAX = 45;               // hide a last-seen marker after this many seconds
 const $ = id => document.getElementById(id);
 
 // ---- canvas sizing (square, fits viewport) --------------------------------
@@ -69,12 +72,13 @@ resize();
 // world x/z, smoothing the bounds so the view doesn't jitter frame to frame.
 function updateAutoFit(objects) {
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, any = false;
-  for (const o of objects) {
-    if (typeof o.x !== "number" || typeof o.z !== "number") continue;
+  const consider = (x, z) => {
+    if (typeof x !== "number" || typeof z !== "number") return;
     any = true;
-    minX = Math.min(minX, o.x); maxX = Math.max(maxX, o.x);
-    minZ = Math.min(minZ, o.z); maxZ = Math.max(maxZ, o.z);
-  }
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  };
+  for (const o of objects) { consider(o.x, o.z); consider(o.lastX, o.lastZ); }
   if (!any) return;
   // pad + keep square
   const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
@@ -86,18 +90,18 @@ function updateAutoFit(objects) {
   for (const k in target) fit[k] += (target[k] - fit[k]) * a;
 }
 
-function project(o) {
+function projectCoords(nx, ny, x, z) {
   const m = canvas._css;
-  if (typeof o.nx === "number" && typeof o.ny === "number") {
-    return [o.nx * m, o.ny * m];
-  }
-  if (fit && typeof o.x === "number" && typeof o.z === "number") {
-    const nx = (o.x - fit.minX) / (fit.maxX - fit.minX);
-    const ny = 1 - (o.z - fit.minZ) / (fit.maxZ - fit.minZ);
-    return [nx * m, ny * m];
+  if (typeof nx === "number" && typeof ny === "number") return [nx * m, ny * m];
+  if (fit && typeof x === "number" && typeof z === "number") {
+    const NX = (x - fit.minX) / (fit.maxX - fit.minX);
+    const NY = 1 - (z - fit.minZ) / (fit.maxZ - fit.minZ);
+    return [NX * m, NY * m];
   }
   return null;
 }
+function project(o) { return projectCoords(o.nx, o.ny, o.x, o.z); }
+function projectLast(o) { return projectCoords(o.lastNx, o.lastNy, o.lastX, o.lastZ); }
 
 // ---- drawing --------------------------------------------------------------
 function colorFor(o, selfId) {
@@ -129,11 +133,41 @@ function draw() {
 
   for (const o of objects) {
     if (o.alive === false) continue;
+    const r = (o.type === "Battleship") ? 6 : (o.type === "Destroyer") ? 4 : 5;
+    const col = colorFor(o, selfId);
+    const live = (o.visible !== false) && (typeof o.nx === "number" || typeof o.x === "number");
+
+    if (!live) {
+      // last-seen ghost: dashed, faded marker at the last known spot
+      const stale = (typeof o.staleSeconds === "number") ? o.staleSeconds : 0;
+      const hasLast = (typeof o.lastNx === "number") || (typeof o.lastX === "number");
+      if (!hasLast || stale > GHOST_MAX) continue;
+      const p = projectLast(o);
+      if (!p) continue;
+      const [x, y] = p;
+      ctx.globalAlpha = Math.max(0.12, 0.5 * (1 - stale / GHOST_MAX));
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      if (typeof o.lastYaw === "number") {
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + Math.sin(o.lastYaw) * (r + 8), y - Math.cos(o.lastYaw) * (r + 8));
+        ctx.stroke();
+      }
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      if (o.name) {
+        ctx.fillStyle = "rgba(200,215,222,.5)";
+        ctx.font = "9px Segoe UI, sans-serif";
+        ctx.fillText(o.name + " " + Math.round(stale) + "s", x + r + 3, y + 3);
+      }
+      continue;
+    }
+
     const p = project(o);
     if (!p) continue;
     const [x, y] = p;
-    const col = colorFor(o, selfId);
-    const r = (o.type === "Battleship") ? 6 : (o.type === "Destroyer") ? 4 : 5;
 
     // heading wedge
     if (typeof o.yaw === "number") {
@@ -171,8 +205,14 @@ function render() {
   if (snap) {
     $("mapName").textContent = (snap.map && snap.map.name) || "(unknown)";
     $("battleType").textContent = snap.battleType || "-";
-    const objs = (snap.objects || []).filter(o => o.alive !== false);
-    $("shipCount").textContent = objs.length;
+    const alive = (snap.objects || []).filter(o => o.alive !== false);
+    const liveN = alive.filter(o =>
+      o.visible !== false && (typeof o.nx === "number" || typeof o.x === "number")).length;
+    const ghostN = alive.filter(o =>
+      o.visible === false && ((typeof o.lastNx === "number") || (typeof o.lastX === "number")) &&
+      (typeof o.staleSeconds !== "number" || o.staleSeconds <= GHOST_MAX)).length;
+    $("shipCount").textContent = liveN;
+    $("ghostCount").textContent = ghostN;
     $("boundsMode").textContent = hasServerBounds() ? "from map" : "auto-fit";
     const dmg = snap.damage && snap.damage.teamTotal;
     if (dmg && Object.keys(dmg).length) {

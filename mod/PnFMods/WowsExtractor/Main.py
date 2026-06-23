@@ -40,6 +40,7 @@ except:
     CC = None
 
 STATE_INTERVAL = 0.1          # seconds between state.json writes (~10 Hz)
+LAST_SEEN_TTL = 60.0          # keep reporting a dark ship's last-known spot this long
 SCHEMA_VERSION = 1
 INVALID = -1
 
@@ -417,7 +418,9 @@ class Collector(object):
         self._selfPlayerId = None
         self._damage = DamageTracker()
         self._ballistics = BallisticsTracker()
-        self._playerCache = {}   # playerId -> {name, teamId, relation, ship{...}}
+        # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
+        # have seen, so enemies that lit up then went dark keep a "ghost" marker.
+        self._lastSeen = {}
 
         events.onBattleStart(self._on_battle_start)
         events.onBattleShown(self._on_battle_shown)
@@ -447,7 +450,7 @@ class Collector(object):
     def _on_battle_start(self, *args):
         self._resolve_paths()
         self._damage.clear()
-        self._playerCache = {}
+        self._lastSeen = {}
         self._selfPlayerId = _try(lambda: battle.getSelfPlayerInfo().id)
 
     def _on_battle_shown(self, *args):
@@ -467,6 +470,7 @@ class Collector(object):
         self._active = False
         self._stop_tick()
         self._ballistics.stop()
+        self._lastSeen = {}
         # write one final snapshot marking the battle inactive
         try:
             snap = {'schema': SCHEMA_VERSION, 'active': False, 'ts': _now(),
@@ -619,7 +623,7 @@ class Collector(object):
             'active': True,
             'ts': now,
             'self': self._build_self(),
-            'ships': self._build_ships(),
+            'ships': self._build_ships(now),
             'damage': self._damage.snapshot(),
             'ballistics': _try(lambda: self._ballistics.snapshot(), {'available': False}),
         }
@@ -651,9 +655,46 @@ class Collector(object):
         data['isObserver'] = _try(lambda: battle.isObserverMode(), False)
         return data if data else None
 
-    def _build_ships(self):
+    def _ship_key(self, entry):
+        """Stable per-battle key for last-seen tracking (prefixed to avoid
+        collisions between different id namespaces)."""
+        for k in ('vehicleId', 'uiId', 'playerId'):
+            v = entry.get(k)
+            if v is not None:
+                return k[0] + str(v)
+        return None
+
+    def _remember(self, key, entry, pos, now):
+        self._lastSeen[key] = {
+            'identity': {
+                'uiId': entry.get('uiId'),
+                'vehicleId': entry.get('vehicleId'),
+                'playerId': entry.get('playerId'),
+                'teamId': entry.get('teamId'),
+                'relation': entry.get('relation'),
+                'name': entry.get('name'),
+                'shipType': entry.get('shipType'),
+            },
+            'pos': pos,
+            'yaw': entry.get('yaw'),
+            'health': entry.get('health'),
+            'ts': now,
+        }
+
+    def _apply_ghost(self, target, seen, now):
+        """Attach lastPosition/staleSeconds fields onto target from a cache entry."""
+        target['lastPosition'] = seen['pos']
+        if seen.get('yaw') is not None:
+            target['lastYaw'] = seen['yaw']
+        if seen.get('health') is not None:
+            target['lastHealth'] = seen['health']
+        target['lastSeenTs'] = seen['ts']
+        target['staleSeconds'] = now - seen['ts']
+
+    def _build_ships(self, now):
         ships = _try(lambda: battle.getAllShips(), []) or []
         out = []
+        seen_keys = set()
         for ship in ships:
             entry = {}
             entry['uiId'] = _try(lambda: ship.uiId)
@@ -686,7 +727,41 @@ class Collector(object):
                 if entry.get('teamId') is None:
                     entry['teamId'] = _try(lambda: player.teamId)
                     entry['relation'] = self._relation(entry['teamId'])
+
+            key = self._ship_key(entry)
+            if key is not None:
+                seen_keys.add(key)
+            alive = entry.get('alive')
+            if alive is False:
+                # sunk ship: drop any ghost memory, no last-seen marker
+                if key is not None and key in self._lastSeen:
+                    del self._lastSeen[key]
+            elif pos:
+                if key is not None:
+                    self._remember(key, entry, pos, now)
+            elif key is not None:
+                # alive but no position this frame -> went dark; reuse last spot
+                seen = self._lastSeen.get(key)
+                if seen is not None:
+                    if (now - seen['ts']) <= LAST_SEEN_TTL:
+                        self._apply_ghost(entry, seen, now)
+                    else:
+                        del self._lastSeen[key]
             out.append(entry)
+
+        # ships no longer returned by getAllShips() at all: emit ghost-only rows
+        for key in list(self._lastSeen.keys()):
+            if key in seen_keys:
+                continue
+            seen = self._lastSeen[key]
+            if (now - seen['ts']) > LAST_SEEN_TTL:
+                del self._lastSeen[key]
+                continue
+            ghost = dict(seen['identity'])
+            ghost['alive'] = True
+            ghost['visible'] = False
+            self._apply_ghost(ghost, seen, now)
+            out.append(ghost)
         return out
 
 

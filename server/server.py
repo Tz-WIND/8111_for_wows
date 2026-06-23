@@ -138,6 +138,21 @@ def build_map_objects(meta, state):
         }
         if norm:
             obj["nx"], obj["ny"] = norm[0], norm[1]
+
+        # last-known ("ghost") position for ships that lit up then went dark
+        last_pos = s.get("lastPosition")
+        if last_pos:
+            obj["lastX"], obj["lastZ"] = last_pos[0], last_pos[2]
+            lnorm = normalize(last_pos, bounds)
+            if lnorm:
+                obj["lastNx"], obj["lastNy"] = lnorm[0], lnorm[1]
+            if s.get("lastYaw") is not None:
+                obj["lastYaw"] = s.get("lastYaw")
+            if s.get("lastHealth") is not None:
+                obj["lastHealth"] = s.get("lastHealth")
+            obj["lastSeenTs"] = s.get("lastSeenTs")
+            obj["staleSeconds"] = s.get("staleSeconds")
+
         objects.append(obj)
     return objects, bounds
 
@@ -247,6 +262,7 @@ async def demo_generator(app, interval):
         "roster": roster,
     })
 
+    last = {}   # uiId -> last visible {pos, yaw, health, ts}; drives demo ghosts
     t0 = time.time()
     while True:
         t = time.time() - t0
@@ -255,17 +271,32 @@ async def demo_generator(app, interval):
             ang = s["phase"] + t * 0.05 * (1 if s["teamId"] == 0 else -1)
             x = s["radius"] * math.cos(ang)
             z = s["radius"] * math.sin(ang) + (-6000 if s["teamId"] == 0 else 6000)
-            objs.append({
-                "uiId": s["uiId"], "vehicleId": s["vehicleId"], "playerId": s["playerId"],
-                "teamId": s["teamId"], "relation": 1 if s["teamId"] == 0 else 2,
-                "alive": True, "visible": True, "position": [x, 0.0, z],
-                "yaw": ang + math.pi / 2,
-                "health": 80000 * (0.4 + 0.6 * abs(math.sin(ang))), "maxHealth": 80000,
-            })
+            yaw = ang + math.pi / 2
+            health = 80000 * (0.4 + 0.6 * abs(math.sin(ang)))
+            # allies always visible; enemies blink in/out to simulate spotting
+            visible = (s["teamId"] == 0) or (math.sin(t * 0.25 + s["phase"] * 1.7) > -0.35)
+            obj = {"uiId": s["uiId"], "vehicleId": s["vehicleId"], "playerId": s["playerId"],
+                   "teamId": s["teamId"], "relation": 1 if s["teamId"] == 0 else 2,
+                   "alive": True, "maxHealth": 80000}
+            if visible:
+                last[s["uiId"]] = {"pos": [x, 0.0, z], "yaw": yaw, "health": health, "ts": t}
+                obj.update({"visible": True, "position": [x, 0.0, z],
+                            "yaw": yaw, "health": health})
+            else:
+                obj["visible"] = False
+                seen = last.get(s["uiId"])
+                if seen is not None:
+                    obj["lastPosition"] = seen["pos"]
+                    obj["lastYaw"] = seen["yaw"]
+                    obj["lastHealth"] = seen["health"]
+                    obj["lastSeenTs"] = seen["ts"]
+                    obj["staleSeconds"] = t - seen["ts"]
+            objs.append(obj)
+        self_obj = objs[0]   # ship 0 is an always-visible ally
         store.set(state={
             "schema": 1, "active": True, "ts": t,
-            "self": {"playerId": 2000, "teamId": 0, "position": objs[0]["position"],
-                     "yaw": objs[0]["yaw"], "health": objs[0]["health"],
+            "self": {"playerId": 2000, "teamId": 0, "position": self_obj.get("position"),
+                     "yaw": self_obj.get("yaw"), "health": self_obj.get("health"),
                      "maxHealth": 80000, "speed": 30.0, "isObserver": False},
             "ships": objs,
             "damage": {"inflicted": {}, "received": {}, "teamTotal": {}},
