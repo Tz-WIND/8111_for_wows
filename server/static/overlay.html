@@ -33,6 +33,8 @@
   <div class="row"><span>Map</span><span id="mapName">-</span></div>
   <div class="row"><span>Mode</span><span id="battleType">-</span></div>
   <div class="row"><span>Ships</span><span id="shipCount">0</span></div>
+  <div class="row"><span>Allies</span><span id="allyInfo">-</span></div>
+  <div class="row"><span>Enemies</span><span id="enemyInfo">-</span></div>
   <div class="row"><span>Last-seen</span><span id="ghostCount">0</span></div>
   <div class="row"><span>Bounds</span><span id="boundsMode">auto-fit</span></div>
   <div id="scoreLine"></div>
@@ -213,6 +215,16 @@ function render() {
       (typeof o.staleSeconds !== "number" || o.staleSeconds <= GHOST_MAX)).length;
     $("shipCount").textContent = liveN;
     $("ghostCount").textContent = ghostN;
+    const d = snap.diag;
+    if (d) {
+      $("allyInfo").textContent = d.alliesVisible + "/" + d.allies + " spotted";
+      $("enemyInfo").textContent = d.enemiesVisible + "/" + d.enemies + " spotted";
+    } else {
+      const allyN = alive.filter(o => o.relation === 1).length;
+      const enemyN = alive.filter(o => o.relation === 2).length;
+      $("allyInfo").textContent = allyN;
+      $("enemyInfo").textContent = enemyN;
+    }
     $("boundsMode").textContent = hasServerBounds() ? "from map" : "auto-fit";
     const dmg = snap.damage && snap.damage.teamTotal;
     if (dmg && Object.keys(dmg).length) {

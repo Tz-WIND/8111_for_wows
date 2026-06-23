@@ -61,5 +61,9 @@ probe_dump.txt
 *.log
 python.log
 
+# Local config (copy config.example.ini -> config.ini in each folder)
+/config.ini
+mod/PnFMods/WowsExtractor/config.ini
+
 # Third-party reference mods (local dev only, not redistributed)
 参考mods/

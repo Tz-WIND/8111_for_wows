@@ -171,6 +171,7 @@ def build_all(meta, state):
         "roster": (meta or {}).get("roster", []),
         "damage": (state or {}).get("damage", {}),
         "ballistics": (state or {}).get("ballistics", {}),
+        "diag": (state or {}).get("diag"),
     }
 
 
@@ -293,6 +294,9 @@ async def demo_generator(app, interval):
                     obj["staleSeconds"] = t - seen["ts"]
             objs.append(obj)
         self_obj = objs[0]   # ship 0 is an always-visible ally
+        vis_allies = sum(1 for o in objs if o.get("teamId") == 0 and o.get("visible"))
+        vis_enemies = sum(1 for o in objs if o.get("teamId") == 1 and o.get("visible"))
+        ghost_n = sum(1 for o in objs if not o.get("visible") and o.get("lastPosition"))
         store.set(state={
             "schema": 1, "active": True, "ts": t,
             "self": {"playerId": 2000, "teamId": 0, "position": self_obj.get("position"),
@@ -301,6 +305,8 @@ async def demo_generator(app, interval):
             "ships": objs,
             "damage": {"inflicted": {}, "received": {}, "teamTotal": {}},
             "ballistics": {"available": True, "ammoType": "AP", "penetration": 650},
+            "diag": {"totalShips": 10, "allies": 5, "alliesVisible": vis_allies,
+                     "enemies": 5, "enemiesVisible": vis_enemies, "ghosts": ghost_n},
         })
         await broadcast(app)
         await asyncio.sleep(interval)
@@ -397,6 +403,29 @@ async def h_ballistics(request):
     return jr((request.app["store"].state or {}).get("ballistics", {}))
 
 
+async def h_debug(request):
+    s = request.app["store"]
+    state = s.state or {}
+    diag = state.get("diag", {})
+    ships_raw = state.get("ships", [])
+    per_ship = []
+    for sh in ships_raw:
+        per_ship.append({
+            "uiId": sh.get("uiId"),
+            "playerId": sh.get("playerId"),
+            "relation": sh.get("relation"),
+            "teamId": sh.get("teamId"),
+            "alive": sh.get("alive"),
+            "visible": sh.get("visible"),
+            "hasPosition": sh.get("position") is not None,
+            "hasLastPosition": sh.get("lastPosition") is not None,
+            "staleSeconds": sh.get("staleSeconds"),
+            "name": sh.get("name"),
+            "shipType": sh.get("shipType"),
+        })
+    return jr({"diag": diag, "ships": per_ship})
+
+
 async def h_ws(request):
     store = request.app["store"]
     ws = web.WebSocketResponse(heartbeat=20.0)
@@ -436,6 +465,7 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <li><span class="tag"><a href="/roster">/roster</a></span> 24-player roster + consumable ranges</li>
  <li><span class="tag"><a href="/damage">/damage</a></span> inflicted / received / team totals</li>
  <li><span class="tag"><a href="/ballistics">/ballistics</a></span> current shell penetration / ricochet</li>
+ <li><span class="tag"><a href="/debug">/debug</a></span> per-ship visibility diagnostics</li>
  <li><span class="tag">/ws</span> WebSocket stream (pushes <code>/all</code> on every update)</li>
  <li><span class="tag"><a href="/healthz">/healthz</a></span> server status</li>
  <li><span class="tag"><a href="/overlay">/overlay</a></span> demo minimap overlay</li>
@@ -446,6 +476,29 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
 # ===========================================================================
 # bootstrap
 # ===========================================================================
+def load_config_file(path):
+    """Parse a trivial `key = value` config (same format the in-game mod reads).
+    Missing file -> empty dict. '#' or ';' begins a comment."""
+    cfg = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return cfg
+    except Exception:
+        return cfg
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        i = line.find("=")
+        key = line[:i].strip().lower()
+        val = line[i + 1:].strip()
+        if key:
+            cfg[key] = val
+    return cfg
+
+
 def find_state_file(game_dir):
     """Locate state.json under <game_dir>/bin/<build>/res_mods/PnFMods/WowsExtractor/."""
     bin_dir = os.path.join(game_dir, "bin")
@@ -485,6 +538,7 @@ def build_app(config):
     app.router.add_get("/roster", h_roster)
     app.router.add_get("/damage", h_damage)
     app.router.add_get("/ballistics", h_ballistics)
+    app.router.add_get("/debug", h_debug)
     app.router.add_get("/ws", h_ws)
     app.router.add_get("/overlay", h_overlay)
     app.router.add_get("/overlay.html", h_overlay)
@@ -515,14 +569,17 @@ def build_app(config):
 
 
 def parse_args(argv):
+    # Defaults are intentionally None so we can tell "user passed this flag" apart
+    # from "use the config.ini value (or the built-in default)". See resolve in main().
     p = argparse.ArgumentParser(description="8111-style telemetry server for World of Warships")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8111)
+    p.add_argument("--config", help="path to config.ini (default: repo-root config.ini)")
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
     p.add_argument("--state-file", help="explicit path to state.json")
     p.add_argument("--meta-file", help="explicit path to meta.json (defaults to state dir)")
     p.add_argument("--game-dir", help="World_of_Warships install dir (auto-find state.json)")
-    p.add_argument("--poll-interval", type=float, default=0.1, help="file poll interval (s)")
-    p.add_argument("--static-dir", default=DEFAULT_STATIC)
+    p.add_argument("--poll-interval", type=float, default=None, help="file poll interval (s)")
+    p.add_argument("--static-dir", default=None)
     p.add_argument("--demo", action="store_true", help="serve synthetic data (no game needed)")
     return p.parse_args(argv)
 
@@ -530,33 +587,61 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
+    # Load config.ini (repo root by default). Precedence: CLI flag > config.ini > built-in default.
+    repo_root = os.path.dirname(HERE)
+    config_path = args.config or os.path.join(repo_root, "config.ini")
+    file_cfg = load_config_file(config_path)
+    cfg_loaded = bool(file_cfg)
+
+    def pick(cli_val, key, default, cast=str):
+        if cli_val is not None:
+            return cli_val
+        raw = file_cfg.get(key)
+        if raw is None or raw == "":
+            return default
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            print("[warn] config.ini: bad value for %s=%r, using %r" % (key, raw, default))
+            return default
+
+    host = pick(args.host, "host", "127.0.0.1")
+    port = pick(args.port, "port", 8111, int)
+    poll_interval = pick(args.poll_interval, "poll_interval", 0.1, float)
+    static_dir = pick(args.static_dir, "static_dir", DEFAULT_STATIC)
+    game_dir = pick(args.game_dir, "game_dir", None)
+    state_file = pick(args.state_file, "state_file", None)
+    meta_file = pick(args.meta_file, "meta_file", None)
+
     if args.demo:
         source_desc = "DEMO (synthetic data)"
-        config = {"demo": True, "interval": max(args.poll_interval, 0.05),
-                  "static_dir": args.static_dir, "state_file": None, "meta_file": None}
+        config = {"demo": True, "interval": max(poll_interval, 0.05),
+                  "static_dir": static_dir, "state_file": None, "meta_file": None}
     else:
-        state_file = args.state_file
-        if not state_file and args.game_dir:
-            state_file = find_state_file(args.game_dir)
+        if not state_file and game_dir:
+            state_file = find_state_file(game_dir)
             if not state_file:
-                print("[warn] could not auto-find state.json under %s/bin/*/res_mods/..." % args.game_dir)
+                print("[warn] could not auto-find state.json under %s/bin/*/res_mods/..." % game_dir)
         if not state_file:
-            print("ERROR: provide --state-file PATH, or --game-dir DIR, or use --demo")
+            print("ERROR: set 'game_dir' in %s, or pass --game-dir/--state-file, or use --demo"
+                  % config_path)
             return 2
-        meta_file = args.meta_file or os.path.join(os.path.dirname(state_file), "meta.json")
+        if not meta_file:
+            meta_file = os.path.join(os.path.dirname(state_file), "meta.json")
         source_desc = "state=%s" % state_file
-        config = {"demo": False, "interval": max(args.poll_interval, 0.02),
-                  "static_dir": args.static_dir, "state_file": state_file, "meta_file": meta_file}
+        config = {"demo": False, "interval": max(poll_interval, 0.02),
+                  "static_dir": static_dir, "state_file": state_file, "meta_file": meta_file}
 
     print("=" * 64)
-    print(" 8111 for WoWS (aiohttp)  --  http://%s:%d/" % (args.host, args.port))
-    print(" overlay:        http://%s:%d/overlay" % (args.host, args.port))
-    print(" websocket:      ws://%s:%d/ws" % (args.host, args.port))
+    print(" 8111 for WoWS (aiohttp)  --  http://%s:%d/" % (host, port))
+    print(" overlay:        http://%s:%d/overlay" % (host, port))
+    print(" websocket:      ws://%s:%d/ws" % (host, port))
+    print(" config:         %s" % (config_path if cfg_loaded else "%s (not found, using defaults)" % config_path))
     print(" source:         %s" % source_desc)
     print("=" * 64)
 
     app = build_app(config)
-    web.run_app(app, host=args.host, port=args.port, access_log=None, print=None)
+    web.run_app(app, host=host, port=port, access_log=None, print=None)
     return 0
 
 

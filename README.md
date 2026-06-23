@@ -30,9 +30,12 @@
 ```text
 8111_for_wows/
 ├─ mod/                                  # 游戏内采集器（拷进 res_mods）
-│  └─ PnFMods/WowsExtractor/Main.py
+│  └─ PnFMods/WowsExtractor/
+│     ├─ Main.py
+│     └─ config.example.ini              # 采集器配置模板（复制为 config.ini）
 ├─ tools/probe/                          # 探针 mod（一次性诊断，确认字段名）
 │  └─ PnFMods/WowsProbe/Main.py
+├─ config.example.ini                    # 服务端配置模板（复制为 config.ini）
 ├─ pyproject.toml                        # uv 项目定义（依赖 aiohttp）
 ├─ uv.lock                               # uv 锁定文件
 ├─ server/
@@ -41,13 +44,19 @@
 │  ├─ static/overlay.html                # 演示用小地图 overlay
 │  ├─ examples/ws_client.py              # 示例消费端（WS + REST）
 │  └─ sample_data/                       # 离线测试用样例 state.json / meta.json
-├─ run_server.bat                        # 一键启动服务（先改里面的 GAME_DIR）
+├─ run_server.bat                        # 一键启动服务（设置都在 config.ini，见下方）
 └─ README.md
 ```
 
 ---
 
 ## 快速开始（不需要游戏，先看效果）
+
+`--demo` 模式不需要 `config.ini`。若要跑真实数据，先复制配置模板：
+
+```bash
+copy config.example.ini config.ini
+```
 
 服务端用 [`uv`](https://docs.astral.sh/uv/) 管理环境，依赖 `aiohttp`。在仓库根目录执行：
 
@@ -89,23 +98,34 @@ ModsAPI 的 Python mod 由 `PnFModsLoader.py` 加载。如果你的 `res_mods/` 
 
 ### 第 2 步：装采集器
 
-1. 把 `mod/PnFMods/WowsExtractor/` 复制到
+1. 把整个 `mod/PnFMods/WowsExtractor/`（含 `Main.py` 和 `config.example.ini`）复制到
    `World_of_Warships/bin/<最新build号>/res_mods/PnFMods/WowsExtractor/`
 2. 确保 `res_mods/` 下有 `PnFModsLoader.py`
-3. 进战斗后，采集器会在自己目录下生成：
+3. （可选）在同目录执行 `copy config.example.ini config.ini`，按需修改 `config.ini`（例如把采集频率 `state_interval` 调大一点更省帧）；缺 `config.ini` 就用内置默认（10Hz）
+4. 进战斗后，采集器会在自己目录下生成：
    - `meta.json`：开局写一次（名单、舰种/tier、消耗品范围、地图信息）
-   - `state.json`：约每 100ms 写一次（可见舰船位置/航向/血量、自身、伤害、弹道）
+   - `state.json`：默认约每 100ms 写一次（可见舰船位置/航向/血量、自身、伤害、弹道）
 
 确认是否生效：看 `python.log` 里的 `[WowsExtractor] writing telemetry to: <绝对路径>`。
 
+> **性能**：采集器把 JSON 编码与写盘放到后台线程（沙箱不允许线程时自动退回同步写），所以即便 10Hz 也几乎不占游戏帧数。想再省一点就把 `config.ini` 里的 `state_interval` 调到 `0.15` 或 `0.2`。
+
 ### 第 3 步：启动服务
 
-编辑 `run_server.bat` 顶部的 `GAME_DIR` 指向你的安装目录，然后双击它（它会自动 `uv sync` 再启动）。或在仓库根目录手动：
+在仓库根目录复制并编辑配置，把 `game_dir` 指向你的安装目录（端口等也在里面）：
 
 ```bash
-# 自动在 <game>/bin/<最新build>/res_mods/PnFMods/WowsExtractor/ 下找 state.json
-uv run python server/server.py --game-dir "D:\Games\World_of_Warships"
-# 或直接指定文件
+copy config.example.ini config.ini
+# 编辑 config.ini 里的 game_dir
+```
+
+然后双击 `run_server.bat`（它会自动 `uv sync` 再启动）。或在仓库根目录手动：
+
+```bash
+# 默认读取 config.ini（game_dir / host / port / poll_interval）
+uv run python server/server.py
+# 命令行参数会覆盖 config.ini，例如临时换端口或指定文件：
+uv run python server/server.py --port 8125
 uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtractor\state.json"
 ```
 
@@ -113,10 +133,39 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 
 ---
 
+## 配置文件
+
+| 位置 | 初始化 |
+| --- | --- |
+| 仓库根（服务端） | `copy config.example.ini config.ini` |
+| `mod/PnFMods/WowsExtractor/`（采集器） | `copy config.example.ini config.ini`（拷进游戏目录后执行） |
+
+**① 仓库根 `config.ini` — 服务端读**
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `game_dir` | — | 游戏安装目录，自动定位 `state.json`（原来写在 `run_server.bat` 里的路径搬到这里了） |
+| `host` | `127.0.0.1` | 监听地址 |
+| `port` | `8111` | 监听端口（和战雷冲突就改掉） |
+| `poll_interval` | `0.1` | 文件轮询间隔（秒），建议 ≤ 采集器的 `state_interval` |
+| `state_file` / `meta_file` | — | 可选：跳过自动查找，直接指定文件路径 |
+
+**② `mod/PnFMods/WowsExtractor/config.ini` — 游戏内采集器读**
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `state_interval` | `0.1` | 写 `state.json` 的间隔（秒）。`0.1`=10Hz；调成 `0.15`/`0.2` 更省帧（代码里最小限制 `0.02`） |
+| `last_seen_ttl` | `60.0` | 敌舰消失后小地图保留"残影"标记多久（秒） |
+
+> 命令行参数 **>** `config.ini` **>** 内置默认。即用 `run_server.bat --port 8125` 之类的 flag 仍可临时覆盖配置。
+
+---
+
 ## 命令行参数（`server.py`）
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
+| `--config` | 仓库根 `config.ini` | 指定其它配置文件 |
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8111` | 监听端口（和战雷冲突就改掉） |
 | `--game-dir` | — | 游戏安装目录，自动定位 `state.json` |
@@ -125,6 +174,8 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 | `--poll-interval` | `0.1` | 文件轮询间隔（秒） |
 | `--static-dir` | `server/static` | overlay 等静态文件目录 |
 | `--demo` | 关 | 用合成数据跑，不需要游戏 |
+
+> 表中"默认"列指**既没传命令行、`config.ini` 里也没设**时的内置值。
 
 ---
 
@@ -206,7 +257,7 @@ curl http://127.0.0.1:8124/map_obj.json
 ## 故障排查
 
 - **没有 `state.json`**：确认 mod 在 `res_mods/PnFMods/WowsExtractor/`（不是 `mod/` 这层），且 `res_mods/` 下有 `PnFModsLoader.py`；看 `python.log` 有没有 `[WowsExtractor] loaded`。
-- **服务端找不到文件**：用 `--state-file` 直接指定 `python.log` 里打印的那个绝对路径。
+- **服务端找不到文件**：确认根目录已有 `config.ini`（从 `config.example.ini` 复制）且 `game_dir` 正确；或用 `--state-file` 直接指定 `python.log` 里打印的那个绝对路径。
 - **overlay 上船都挤在一起 / 位置不准**：多半是地图边界未知走了 auto-fit。跑探针确认边界 API，把 `minX/maxX/minZ/maxZ` 填进采集器的 `_build_map_info()`。
 - **某些字段为 null**：该客户端版本的属性名不同。看 `probe_dump.txt` 对照修正属性名（缺字段不会崩，只是为空）。
 - **端口被占用**：`--port` 换一个。

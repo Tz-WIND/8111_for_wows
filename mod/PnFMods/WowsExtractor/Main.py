@@ -34,13 +34,55 @@ except:
     except:
         os = None
 
+# The standard `json` module is *much* faster than our pure-python fallback.
+# It may be blocked by the sandbox importer (like `os`), so this is best-effort.
+try:
+    import json as _json_module
+except:
+    _json_module = None
+
+
+def _get_threading():
+    """Best-effort handle to the `threading` module.
+
+    The collector's only heavy per-frame cost (JSON encoding + disk I/O) is moved
+    off the game thread onto a background writer when threading is available. The
+    sandbox may block `import threading`; if so we try to borrow an already-loaded
+    copy (same idea as the `os` trick) and otherwise fall back to synchronous
+    writes -- correctness is identical either way, only smoothness differs.
+    """
+    try:
+        import threading as _t
+        if hasattr(_t, 'Thread'):
+            return _t
+    except:
+        pass
+    try:
+        import sys as _sys
+        for _m in list(_sys.modules.values()):
+            try:
+                _t = getattr(_m, 'threading', None)
+                if _t is not None and hasattr(_t, 'Thread') and hasattr(_t, 'Lock'):
+                    return _t
+            except:
+                pass
+    except:
+        pass
+    return None
+
+
+_threading = _get_threading()
+
+# sentinel used to memoize values that may legitimately be None
+_UNSET = object()
+
 try:
     CC = constants.UiComponents
 except:
     CC = None
 
-STATE_INTERVAL = 0.1          # seconds between state.json writes (~10 Hz)
-LAST_SEEN_TTL = 60.0          # keep reporting a dark ship's last-known spot this long
+STATE_INTERVAL = 0.1          # default seconds between state.json writes (~10 Hz); see config.ini
+LAST_SEEN_TTL = 60.0          # default: keep reporting a dark ship's last-known spot this long; see config.ini
 SCHEMA_VERSION = 1
 INVALID = -1
 
@@ -80,6 +122,63 @@ def _try(fn, default=None):
         return default
 
 
+def _get(obj, name, default=None):
+    """getattr() that swallows exceptions -- like `_try(lambda: obj.name)` but
+    without allocating a lambda on every call (this runs in the hot ship loop)."""
+    try:
+        return getattr(obj, name)
+    except:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# config file (config.ini next to this mod). Uses a trivial `key = value` format
+# parsed with plain string ops, so it works even if json/configparser are blocked
+# by the sandbox. A missing/garbled file just means built-in defaults.
+# ---------------------------------------------------------------------------
+def _parse_kv(text):
+    cfg = {}
+    try:
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line or line[0] in ('#', ';') or '=' not in line:
+                continue
+            i = line.find('=')
+            key = line[:i].strip().lower()
+            val = line[i + 1:].strip()
+            if key:
+                cfg[key] = val
+    except:
+        pass
+    return cfg
+
+
+def _cfg_float(cfg, key, default):
+    try:
+        v = cfg.get(key)
+        if v is None or v == '':
+            return default
+        return float(v)
+    except:
+        return default
+
+
+def _load_mod_config():
+    base = _try(lambda: utils.getModDir())
+    if not base:
+        return {}
+    try:
+        f = open(base + '/config.ini', 'rb')
+        try:
+            raw = f.read()
+        finally:
+            f.close()
+        return _parse_kv(raw)
+    except:
+        return {}
+
+
 def _now():
     return _try(lambda: utils.getTimeFromGameStart(), 0.0) or 0.0
 
@@ -105,6 +204,14 @@ def _json_str(s):
         if isinstance(s, unicode):
             s = s.encode('utf-8')
     except NameError:
+        pass
+    # Fast path: the vast majority of our strings (keys, names, enum values) need
+    # no escaping. `min(s)`, `in` are C-level scans -- far cheaper than iterating
+    # every character in pure Python, which is what dominated the old hot path.
+    try:
+        if not s or (min(s) >= ' ' and '"' not in s and '\\' not in s):
+            return '"' + s + '"'
+    except:
         pass
     out = ['"']
     for ch in s:
@@ -156,11 +263,25 @@ def json_dumps(obj):
             return enc(obj)
         except:
             pass
-    try:
-        import json
-        return json.dumps(obj)
-    except:
-        pass
+    if _json_module is not None:
+        try:
+            return _json_module.dumps(obj)
+        except:
+            pass
+    return _json(obj)
+
+
+def _serialize_safe(obj):
+    """Thread-safe serializer for the background writer.
+
+    Deliberately avoids `utils.jsonEncode` -- engine helpers are only safe to call
+    on the game thread. Plain `json` / our pure-python encoder are fine off-thread,
+    and since this no longer runs on the render thread its speed barely matters."""
+    if _json_module is not None:
+        try:
+            return _json_module.dumps(obj)
+        except:
+            pass
     return _json(obj)
 
 
@@ -197,6 +318,97 @@ def _atomic_write(path, text):
     except Exception, e:
         logError('write failed for {}: {}'.format(path, _str(e)))
         return False
+
+
+def _write_file(path, text):
+    """Plain in-place overwrite (no temp+rename churn).
+
+    Used for the high-frequency state.json. A reader that catches a half-written
+    file just parses to None and keeps its last good snapshot (the server does
+    exactly this), and the next write ~0.1s later heals it -- so we trade
+    strict atomicity for far fewer syscalls and no per-tick "new file" that
+    on-access antivirus would re-scan."""
+    try:
+        data = text
+        try:
+            if isinstance(text, unicode):
+                data = text.encode('utf-8')
+        except NameError:
+            pass
+        f = open(path, 'wb')
+        try:
+            f.write(data)
+        finally:
+            f.close()
+        return True
+    except Exception, e:
+        logError('write failed for {}: {}'.format(path, _str(e)))
+        return False
+
+
+# ===========================================================================
+# background writer -- keeps JSON encoding + disk I/O off the game thread
+# ===========================================================================
+class _AsyncWriter(object):
+    """Single daemon thread that serializes plain-data snapshots and writes them
+    to disk. The game thread only builds the (pure python) snapshot dict and drops
+    it in a latest-wins slot per path; if the disk stalls we simply skip stale
+    frames instead of backing up a queue or blocking rendering."""
+
+    def __init__(self, threading_mod):
+        self._lock = threading_mod.Lock()
+        self._event = threading_mod.Event()
+        self._pending = {}        # path -> latest snapshot dict (latest wins)
+        self._alive = True
+        th = threading_mod.Thread(target=self._run)
+        try:
+            th.setName('WowsExtractorWriter')
+        except:
+            pass
+        try:
+            th.setDaemon(True)
+        except:
+            try:
+                th.daemon = True
+            except:
+                pass
+        self._thread = th
+        th.start()
+
+    def submit(self, path, obj):
+        self._lock.acquire()
+        try:
+            self._pending[path] = obj
+        finally:
+            self._lock.release()
+        self._event.set()
+
+    def _drain(self):
+        self._lock.acquire()
+        try:
+            batch = self._pending
+            self._pending = {}
+        finally:
+            self._lock.release()
+        return batch
+
+    def _run(self):
+        while self._alive:
+            try:
+                self._event.wait(1.0)
+                self._event.clear()
+                batch = self._drain()
+                for path, obj in batch.items():
+                    try:
+                        _write_file(path, _serialize_safe(obj))
+                    except:
+                        pass
+            except:
+                # the writer thread must never die on a transient error
+                try:
+                    self._event.clear()
+                except:
+                    pass
 
 
 def _coerce(val):
@@ -416,11 +628,25 @@ class Collector(object):
         self._lastWrite = 0.0
         self._active = False
         self._selfPlayerId = None
+        self._selfTeam = _UNSET       # memoized once per snapshot build
+        self._stateInterval = STATE_INTERVAL
+        self._lastSeenTtl = LAST_SEEN_TTL
+        self._load_config()
         self._damage = DamageTracker()
         self._ballistics = BallisticsTracker()
         # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
         # have seen, so enemies that lit up then went dark keep a "ghost" marker.
         self._lastSeen = {}
+
+        # Move JSON encoding + disk writes off the game thread when possible.
+        self._writer = None
+        if _threading is not None:
+            try:
+                self._writer = _AsyncWriter(_threading)
+                logInfo('async writer enabled (encoding + disk I/O off game thread)')
+            except Exception, e:
+                self._writer = None
+                logError('async writer unavailable, using sync writes: {}'.format(_str(e)))
 
         events.onBattleStart(self._on_battle_start)
         events.onBattleShown(self._on_battle_shown)
@@ -431,7 +657,16 @@ class Collector(object):
         _try(lambda: events.onWeaponTypeChanged(self._ballistics.on_weapon_changed))
         _try(lambda: events.onSquadronActivated(self._ballistics.on_squadron))
         _try(lambda: events.onSquadronDeactivated(self._ballistics.on_squadron_off))
-        logInfo('loaded v{} (state interval {}s)'.format(MOD_VERSION, STATE_INTERVAL))
+        logInfo('loaded v{} (state interval {}s)'.format(MOD_VERSION, self._stateInterval))
+
+    # -- config -------------------------------------------------------------
+    def _load_config(self):
+        """(Re)read config.ini from the mod folder. Called at load and again on
+        each battle start, so edits are picked up without restarting the game."""
+        cfg = _load_mod_config()
+        # clamp the interval so a typo (0 / negative) can't hammer the disk
+        self._stateInterval = max(_cfg_float(cfg, 'state_interval', STATE_INTERVAL), 0.02)
+        self._lastSeenTtl = _cfg_float(cfg, 'last_seen_ttl', LAST_SEEN_TTL)
 
     # -- paths --------------------------------------------------------------
     def _resolve_paths(self):
@@ -448,6 +683,7 @@ class Collector(object):
 
     # -- lifecycle ----------------------------------------------------------
     def _on_battle_start(self, *args):
+        self._load_config()
         self._resolve_paths()
         self._damage.clear()
         self._lastSeen = {}
@@ -471,12 +707,12 @@ class Collector(object):
         self._stop_tick()
         self._ballistics.stop()
         self._lastSeen = {}
-        # write one final snapshot marking the battle inactive
+        # write one final snapshot marking the battle inactive (through the same
+        # single writer, so it can't race a still-queued "active" frame)
         try:
             snap = {'schema': SCHEMA_VERSION, 'active': False, 'ts': _now(),
                     'ships': [], 'self': None}
-            if self._stateFile:
-                _atomic_write(self._stateFile, json_dumps(snap))
+            self._write_state(snap)
         except:
             pass
 
@@ -488,31 +724,58 @@ class Collector(object):
     def _on_damages(self, victimId, damages):
         _try(lambda: self._damage.on_damages(victimId, damages))
 
+    # -- state output -------------------------------------------------------
+    def _write_state(self, snap):
+        """Emit a state snapshot. With the background writer, the game thread does
+        no encoding or disk I/O at all -- it just hands off the plain dict. Without
+        it, fall back to an in-place synchronous write."""
+        path = self._stateFile
+        if not path:
+            return
+        w = self._writer
+        if w is not None:
+            try:
+                w.submit(path, snap)
+                return
+            except:
+                pass
+        _write_file(path, json_dumps(snap))
+
     # -- per-frame (throttled) ---------------------------------------------
     def _tick(self, *args):
         now = _now()
-        if (now - self._lastWrite) < STATE_INTERVAL:
+        if (now - self._lastWrite) < self._stateInterval:
             return
         self._lastWrite = now
         try:
             snap = self._build_state(now)
-            _atomic_write(self._stateFile, json_dumps(snap))
+            self._write_state(snap)
         except Exception, e:
             logError('tick failed: {}'.format(_str(e)))
 
     # -- relation helper ----------------------------------------------------
+    def _self_team(self):
+        """Self team id, memoized for the duration of one snapshot build so we
+        don't hit the engine ~24x per frame (once per ship)."""
+        if self._selfTeam is _UNSET:
+            team = None
+            try:
+                team = battle.getSelfPlayer().teamId
+            except:
+                team = _try(lambda: battle.getSelfPlayerInfo().teamId)
+            self._selfTeam = team
+        return self._selfTeam
+
     def _relation(self, teamId):
         # 0 = self team in observer? We use: 0=self,1=ally,2=enemy
-        try:
-            selfTeam = battle.getSelfPlayer().teamId
-        except:
-            selfTeam = _try(lambda: battle.getSelfPlayerInfo().teamId)
+        selfTeam = self._self_team()
         if selfTeam is None or teamId is None:
             return INVALID
         return 1 if teamId == selfTeam else 2
 
     # -- meta (static per battle) ------------------------------------------
     def _build_meta(self):
+        self._selfTeam = _UNSET
         meta = {
             'schema': SCHEMA_VERSION,
             'mod': {'name': MOD_NAME, 'version': MOD_VERSION},
@@ -618,14 +881,17 @@ class Collector(object):
 
     # -- state (per frame) --------------------------------------------------
     def _build_state(self, now):
+        self._selfTeam = _UNSET   # recompute self team once for this frame
+        ships, diag = self._build_ships(now)
         return {
             'schema': SCHEMA_VERSION,
             'active': True,
             'ts': now,
             'self': self._build_self(),
-            'ships': self._build_ships(now),
+            'ships': ships,
             'damage': self._damage.snapshot(),
             'ballistics': _try(lambda: self._ballistics.snapshot(), {'available': False}),
+            'diag': diag,
         }
 
     def _build_self(self):
@@ -691,42 +957,68 @@ class Collector(object):
         target['lastSeenTs'] = seen['ts']
         target['staleSeconds'] = now - seen['ts']
 
+    def _get_ship_position(self, ship):
+        """Try multiple sources to get a ship's world position.
+        Different WoWS builds expose position via different APIs."""
+        for getter in (lambda: ship.getPosition(),
+                       lambda: ship.position,
+                       lambda: ship.worldPosition,
+                       lambda: ship.positionHull):
+            pos = _vec(_try(getter))
+            if pos:
+                return pos
+        return None
+
     def _build_ships(self, now):
         ships = _try(lambda: battle.getAllShips(), []) or []
         out = []
         seen_keys = set()
+        nAlly = 0
+        nAllyVis = 0
+        nEnemy = 0
+        nEnemyVis = 0
         for ship in ships:
             entry = {}
-            entry['uiId'] = _try(lambda: ship.uiId)
+            entry['uiId'] = _get(ship, 'uiId')
             # the entity id used by getPlayerByVehicleId varies by build; try a few
             vehId = None
-            for getter in (lambda: ship._Ship__id, lambda: ship.id, lambda: ship.vehicleId):
-                vehId = _try(getter)
+            for _name in ('_Ship__id', 'id', 'vehicleId'):
+                vehId = _get(ship, _name)
                 if vehId is not None:
                     break
             if vehId is not None:
                 entry['vehicleId'] = vehId
-            teamId = _try(lambda: ship.teamId)
+            teamId = _get(ship, 'teamId')
             entry['teamId'] = teamId
             entry['relation'] = self._relation(teamId)
             entry['alive'] = _try(lambda: ship.isAlive())
-            pos = _vec(_try(lambda: ship.getPosition()))
+            pos = self._get_ship_position(ship)
             if pos:
                 entry['position'] = pos
                 entry['visible'] = True
             else:
                 entry['visible'] = False
             for k in ('yaw', 'health', 'maxHealth', 'name', 'shipType'):
-                v = _try(lambda: getattr(ship, k))
+                v = _get(ship, k)
                 if v is not None:
                     entry[k] = v
             # link to player roster (name/type) by vehicle id
             player = _try(lambda: battle.getPlayerByVehicleId(vehId)) if vehId is not None else None
             if player is not None:
-                entry['playerId'] = _try(lambda: player.id)
+                entry['playerId'] = _get(player, 'id')
                 if entry.get('teamId') is None:
-                    entry['teamId'] = _try(lambda: player.teamId)
+                    entry['teamId'] = _get(player, 'teamId')
                     entry['relation'] = self._relation(entry['teamId'])
+            # track ally/enemy visibility counts for diagnostics
+            rel = entry.get('relation')
+            if rel == 2:
+                nEnemy += 1
+                if pos:
+                    nEnemyVis += 1
+            elif rel == 1:
+                nAlly += 1
+                if pos:
+                    nAllyVis += 1
 
             key = self._ship_key(entry)
             if key is not None:
@@ -743,18 +1035,19 @@ class Collector(object):
                 # alive but no position this frame -> went dark; reuse last spot
                 seen = self._lastSeen.get(key)
                 if seen is not None:
-                    if (now - seen['ts']) <= LAST_SEEN_TTL:
+                    if (now - seen['ts']) <= self._lastSeenTtl:
                         self._apply_ghost(entry, seen, now)
                     else:
                         del self._lastSeen[key]
             out.append(entry)
 
         # ships no longer returned by getAllShips() at all: emit ghost-only rows
+        nGhost = 0
         for key in list(self._lastSeen.keys()):
             if key in seen_keys:
                 continue
             seen = self._lastSeen[key]
-            if (now - seen['ts']) > LAST_SEEN_TTL:
+            if (now - seen['ts']) > self._lastSeenTtl:
                 del self._lastSeen[key]
                 continue
             ghost = dict(seen['identity'])
@@ -762,7 +1055,15 @@ class Collector(object):
             ghost['visible'] = False
             self._apply_ghost(ghost, seen, now)
             out.append(ghost)
-        return out
+            nGhost += 1
+        return out, {
+            'totalShips': len(ships),
+            'allies': nAlly,
+            'alliesVisible': nAllyVis,
+            'enemies': nEnemy,
+            'enemiesVisible': nEnemyVis,
+            'ghosts': nGhost,
+        }
 
 
 def _is_mapping(o):

@@ -3,18 +3,17 @@ REM ============================================================
 REM  8111 for WoWS -- start the local HTTP + WebSocket server
 REM  (aiohttp, managed by uv).
 REM
-REM  Edit GAME_DIR below to point at your World_of_Warships
-REM  install folder, then double-click this file.
+REM  All settings (game folder, port, poll interval) live in
+REM  config.ini next to this file -- edit that, then double-click.
 REM
-REM  Or run directly, e.g.:
+REM  You can still override on the command line, e.g.:
 REM     run_server.bat --demo
 REM     run_server.bat --game-dir "D:\Games\World_of_Warships"
-REM     run_server.bat --state-file "D:\...\WowsExtractor\state.json"
+REM     run_server.bat --port 8125
+REM     run_server.bat --config "D:\path\to\other-config.ini"
 REM ============================================================
 
 setlocal
-set "GAME_DIR=E:\World_of_Warships"
-set "PORT=8111"
 
 cd /d "%~dp0"
 
@@ -28,11 +27,8 @@ if errorlevel 1 (
 REM create .venv and install aiohttp if needed (fast no-op once synced)
 uv sync
 
-if "%~1"=="" (
-    uv run python server/server.py --port %PORT% --game-dir "%GAME_DIR%"
-) else (
-    uv run python server/server.py --port %PORT% %*
-)
+REM no args -> read everything from config.ini; otherwise pass flags through
+uv run python server/server.py %*
 
 endlocal
 pause

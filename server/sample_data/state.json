@@ -21,5 +21,6 @@
     "teamTotal": {"0": 23400, "1": 8100}
   },
   "ballistics": {"available": true, "ammoType": "AP", "penetration": 482,
-                 "impactSpeed": 690.2, "overmatch": 32.0, "startRicochet": 60.0}
+                 "impactSpeed": 690.2, "overmatch": 32.0, "startRicochet": 60.0},
+  "diag": {"totalShips": 3, "allies": 2, "alliesVisible": 2, "enemies": 1, "enemiesVisible": 1, "ghosts": 0}
 }
