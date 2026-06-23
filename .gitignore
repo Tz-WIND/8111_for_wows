@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments (uv / pip)
+.venv/
+venv/
+ENV/
+env/
+
+# uv
+.uv/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Runtime telemetry (game mod output; keep server/sample_data/)
+state.json
+meta.json
+!server/sample_data/state.json
+!server/sample_data/meta.json
+
+# Probe mod dump
+probe_dump.txt
+**/probe_dump.txt
+
+# Local logs / scratch
+*.log
+python.log
+
+# Third-party reference mods (local dev only, not redistributed)
+参考mods/

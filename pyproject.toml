@@ -1,0 +1,14 @@
+[project]
+name = "wows-8111-extractor"
+version = "0.1.0"
+description = "8111-style HTTP + WebSocket telemetry server for World of Warships"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.10",
+]
+
+# This project ships a runnable app (server/server.py), not an importable
+# library, so tell uv not to try to build/install it as a package.
+[tool.uv]
+package = false

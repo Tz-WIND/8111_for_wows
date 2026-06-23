@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WoWS Minimap Overlay</title>
+<style>
+  :root { --ally:#46e0a0; --enemy:#ff5d5d; --self:#ffd24a; --grid:#1d2c33; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#0a1014; color:#cfe3ea;
+               font:13px/1.4 "Segoe UI", system-ui, Arial; overflow:hidden; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #map { background:#0c161c; box-shadow:0 0 0 1px #20323b, 0 10px 40px rgba(0,0,0,.6);
+         border-radius:6px; }
+  #hud { position:fixed; top:12px; left:12px; padding:10px 12px; background:rgba(8,16,20,.78);
+         border:1px solid #20323b; border-radius:8px; min-width:210px; backdrop-filter:blur(4px); }
+  #hud h1 { margin:0 0 6px; font-size:14px; letter-spacing:.4px; }
+  #hud .row { display:flex; justify-content:space-between; gap:14px; }
+  #hud .row span:last-child { color:#fff; font-variant-numeric:tabular-nums; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+  #status { margin-top:6px; font-size:12px; }
+  #status.ok { color:var(--ally); } #status.bad { color:var(--enemy); }
+  #legend { position:fixed; bottom:12px; left:12px; padding:8px 12px; background:rgba(8,16,20,.78);
+            border:1px solid #20323b; border-radius:8px; font-size:12px; }
+  #scoreLine { margin-top:6px; font-size:12px; color:#9fb6c0; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="map"></canvas></div>
+
+<div id="hud">
+  <h1>8111 &middot; WoWS Overlay</h1>
+  <div class="row"><span>Map</span><span id="mapName">-</span></div>
+  <div class="row"><span>Mode</span><span id="battleType">-</span></div>
+  <div class="row"><span>Ships</span><span id="shipCount">0</span></div>
+  <div class="row"><span>Bounds</span><span id="boundsMode">auto-fit</span></div>
+  <div id="scoreLine"></div>
+  <div id="status" class="bad">connecting&hellip;</div>
+</div>
+
+<div id="legend">
+  <span class="dot" style="background:var(--ally)"></span>Ally
+  <span class="dot" style="background:var(--enemy)"></span>Enemy
+  <span class="dot" style="background:var(--self)"></span>You
+</div>
+
+<script>
+"use strict";
+const canvas = document.getElementById("map");
+const ctx = canvas.getContext("2d");
+let snap = null;                    // latest /all snapshot
+let fit = null;                     // smoothed auto-fit bounds {minX,maxX,minZ,maxZ}
+const $ = id => document.getElementById(id);
+
+// ---- canvas sizing (square, fits viewport) --------------------------------
+function resize() {
+  const m = Math.min(window.innerWidth, window.innerHeight) - 40;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = canvas.style.height = m + "px";
+  canvas.width = canvas.height = Math.round(m * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas._css = m;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---- coordinate mapping ---------------------------------------------------
+// Prefer server-provided nx/ny (uses real map bounds). Otherwise auto-fit from
+// world x/z, smoothing the bounds so the view doesn't jitter frame to frame.
+function updateAutoFit(objects) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, any = false;
+  for (const o of objects) {
+    if (typeof o.x !== "number" || typeof o.z !== "number") continue;
+    any = true;
+    minX = Math.min(minX, o.x); maxX = Math.max(maxX, o.x);
+    minZ = Math.min(minZ, o.z); maxZ = Math.max(maxZ, o.z);
+  }
+  if (!any) return;
+  // pad + keep square
+  const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+  let half = Math.max(maxX - minX, maxZ - minZ) / 2 * 1.25;
+  half = Math.max(half, 2000);
+  const target = { minX: cx - half, maxX: cx + half, minZ: cz - half, maxZ: cz + half };
+  if (!fit) { fit = target; return; }
+  const a = 0.08;  // smoothing
+  for (const k in target) fit[k] += (target[k] - fit[k]) * a;
+}
+
+function project(o) {
+  const m = canvas._css;
+  if (typeof o.nx === "number" && typeof o.ny === "number") {
+    return [o.nx * m, o.ny * m];
+  }
+  if (fit && typeof o.x === "number" && typeof o.z === "number") {
+    const nx = (o.x - fit.minX) / (fit.maxX - fit.minX);
+    const ny = 1 - (o.z - fit.minZ) / (fit.maxZ - fit.minZ);
+    return [nx * m, ny * m];
+  }
+  return null;
+}
+
+// ---- drawing --------------------------------------------------------------
+function colorFor(o, selfId) {
+  if (selfId != null && o.playerId === selfId) return getCss("--self");
+  if (o.relation === 1) return getCss("--ally");
+  if (o.relation === 2) return getCss("--enemy");
+  return "#9aa7ad";
+}
+function getCss(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function draw() {
+  const m = canvas._css;
+  ctx.clearRect(0, 0, m, m);
+
+  // grid (10x10, WoWS-like)
+  ctx.strokeStyle = getCss("--grid"); ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i <= 10; i++) {
+    const p = Math.round(i * m / 10) + 0.5;
+    ctx.moveTo(p, 0); ctx.lineTo(p, m);
+    ctx.moveTo(0, p); ctx.lineTo(m, p);
+  }
+  ctx.stroke();
+
+  if (!snap) return;
+  const objects = snap.objects || [];
+  if (!hasServerBounds()) updateAutoFit(objects);
+  const selfId = snap.self && snap.self.playerId;
+
+  for (const o of objects) {
+    if (o.alive === false) continue;
+    const p = project(o);
+    if (!p) continue;
+    const [x, y] = p;
+    const col = colorFor(o, selfId);
+    const r = (o.type === "Battleship") ? 6 : (o.type === "Destroyer") ? 4 : 5;
+
+    // heading wedge
+    if (typeof o.yaw === "number") {
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + Math.sin(o.yaw) * (r + 9), y - Math.cos(o.yaw) * (r + 9));
+      ctx.stroke();
+    }
+    // body
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.globalAlpha = (typeof o.hpRatio === "number") ? (0.35 + 0.65 * o.hpRatio) : 1;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    if (selfId != null && o.playerId === selfId) {
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, r + 3, 0, Math.PI * 2); ctx.stroke();
+    }
+    // label
+    if (o.name) {
+      ctx.fillStyle = "rgba(255,255,255,.82)";
+      ctx.font = "10px Segoe UI, sans-serif";
+      ctx.fillText(o.name, x + r + 3, y + 3);
+    }
+  }
+}
+
+function hasServerBounds() {
+  return snap && Array.isArray(snap.bounds) && snap.bounds.length === 4;
+}
+
+function render() {
+  if (snap) {
+    $("mapName").textContent = (snap.map && snap.map.name) || "(unknown)";
+    $("battleType").textContent = snap.battleType || "-";
+    const objs = (snap.objects || []).filter(o => o.alive !== false);
+    $("shipCount").textContent = objs.length;
+    $("boundsMode").textContent = hasServerBounds() ? "from map" : "auto-fit";
+    const dmg = snap.damage && snap.damage.teamTotal;
+    if (dmg && Object.keys(dmg).length) {
+      $("scoreLine").textContent = "Team dmg: " +
+        Object.entries(dmg).map(([t, v]) => `T${t}=${Math.round(v)}`).join("  ");
+    } else { $("scoreLine").textContent = ""; }
+  }
+  draw();
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+// ---- transport: WebSocket with polling fallback ---------------------------
+function setStatus(ok, text) {
+  const el = $("status");
+  el.className = ok ? "ok" : "bad";
+  el.textContent = text;
+}
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}/ws`;
+  let ws;
+  try { ws = new WebSocket(url); }
+  catch (e) { return startPolling(); }
+
+  ws.onopen = () => setStatus(true, "live (websocket)");
+  ws.onmessage = ev => { try { snap = JSON.parse(ev.data); } catch (e) {} };
+  ws.onerror = () => {};
+  ws.onclose = () => {
+    setStatus(false, "reconnecting&hellip;");
+    setTimeout(connectWS, 1000);
+  };
+}
+
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer) return;
+  setStatus(true, "live (polling)");
+  pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch("/all", { cache: "no-store" });
+      snap = await r.json();
+    } catch (e) { setStatus(false, "no server"); }
+  }, 200);
+}
+
+connectWS();
+</script>
+</body>
+</html>

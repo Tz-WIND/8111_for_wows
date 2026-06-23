@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "mod": {"name": "WowsExtractor", "version": "0.1.0"},
+  "ts": 5.4,
+  "battleType": "RandomBattle",
+  "selfPlayerId": 537,
+  "map": {"name": "Trap"},
+  "roster": [
+    {"playerId": 537, "teamId": 0, "relation": 1, "name": "You",
+     "shipType": "Battleship", "shipName": "PJSB018_Yamato_1944", "shipTier": 10,
+     "consumables": [{"title": "PCY009_CrashCrewPremium", "params": {"workTime": 20, "reloadTime": 80}}]},
+    {"playerId": 538, "teamId": 0, "relation": 1, "name": "Allydd",
+     "shipType": "Destroyer", "shipName": "PJSD018_Harugumo", "shipTier": 10, "consumables": []},
+    {"playerId": 901, "teamId": 1, "relation": 2, "name": "EnemyCa",
+     "shipType": "Cruiser", "shipName": "PASC020_Des_Moines_1948", "shipTier": 10,
+     "consumables": [{"title": "PCY015_RLSSearchPremium", "params": {"distShip": 11700, "workTime": 25}}]}
+  ]
+}

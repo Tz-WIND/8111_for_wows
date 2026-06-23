@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "active": true,
+  "ts": 42.7,
+  "self": {"playerId": 537, "teamId": 0, "position": [1500.0, 0.0, -3200.0],
+           "yaw": 1.20, "health": 81000, "maxHealth": 97700, "speed": 27.5, "isObserver": false},
+  "ships": [
+    {"uiId": 1, "vehicleId": 1, "playerId": 537, "teamId": 0, "relation": 1,
+     "alive": true, "visible": true, "position": [1500.0, 0.0, -3200.0], "yaw": 1.20,
+     "health": 81000, "maxHealth": 97700},
+    {"uiId": 2, "vehicleId": 2, "playerId": 538, "teamId": 0, "relation": 1,
+     "alive": true, "visible": true, "position": [-4200.0, 0.0, 800.0], "yaw": 2.90,
+     "health": 19500, "maxHealth": 19700},
+    {"uiId": 9, "vehicleId": 9, "playerId": 901, "teamId": 1, "relation": 2,
+     "alive": true, "visible": true, "position": [6100.0, 0.0, 5400.0], "yaw": 4.10,
+     "health": 41000, "maxHealth": 58300}
+  ],
+  "damage": {
+    "inflicted": {"537": {"total": 23400, "byVictim": {"901": 23400}}},
+    "received": {"537": {"total": 8100, "byAttacker": {"901": 8100}}},
+    "teamTotal": {"0": 23400, "1": 8100}
+  },
+  "ballistics": {"available": true, "ammoType": "AP", "penetration": 482,
+                 "impactSpeed": 690.2, "overmatch": 32.0, "startRicochet": 60.0}
+}
