@@ -473,6 +473,20 @@ def _component_pos(comp):
     return None
 
 
+def _point_xy(pt):
+    """Extract [x, y] from a 2D Point-like object (mapPosition.position)."""
+    if pt is None:
+        return None
+    try:
+        return [float(pt.x), float(pt.y)]
+    except:
+        pass
+    try:
+        return [float(pt[0]), float(pt[1])]
+    except:
+        return None
+
+
 def _looks_like_space(v):
     """True if `v` looks like an internal WoWS space id.
 
@@ -678,6 +692,9 @@ class Collector(object):
         # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
         # have seen, so enemies that lit up then went dark keep a "ghost" marker.
         self._lastSeen = {}
+        # cached map->world affine (per battle/map); derived at runtime from ships
+        # that expose BOTH getPosition() (world) and the mapPosition component.
+        self._mapTransform = None
 
         # Move JSON encoding + disk writes off the game thread when possible.
         self._writer = None
@@ -728,6 +745,7 @@ class Collector(object):
         self._resolve_paths()
         self._damage.clear()
         self._lastSeen = {}
+        self._mapTransform = None
         self._selfPlayerId = _try(lambda: battle.getSelfPlayerInfo().id)
 
     def _on_battle_shown(self, *args):
@@ -748,6 +766,7 @@ class Collector(object):
         self._stop_tick()
         self._ballistics.stop()
         self._lastSeen = {}
+        self._mapTransform = None
         # write one final snapshot marking the battle inactive (through the same
         # single writer, so it can't race a still-queued "active" frame)
         try:
@@ -1079,22 +1098,22 @@ class Collector(object):
                             return pos
         return None
 
-    def _collect_entity_positions(self):
-        """Map playerId -> world position read from each ship entity's
-        worldPosition component.
+    def _collect_map_positions(self):
+        """Map playerId -> (mapX, mapY, mapYaw) from each ship entity's
+        mapPosition component.
 
-        ship.getPosition() / shipGameData.position only return a value for ships
-        rendered inside our own 3D bubble. Enemies spotted by a teammate appear on
-        the minimap but have no such position (getPosition() is None). Their
-        coordinates still live on the ship entity's worldPosition component
-        (UiComponents.worldPosition), so we read it directly here to make every
-        spotted ship show up on the overlay."""
+        ship.getPosition() and the worldPosition component are only populated for
+        ships rendered in our own 3D bubble. The mapPosition component, however, is
+        populated for EVERY ship drawn on the minimap -- including enemies spotted
+        only by a teammate. Its `position` is a 2D Point in minimap space, which we
+        convert to world coordinates via a per-battle calibration (see
+        _fit_map_transform)."""
         out = {}
         if CC is None:
             return out
-        wpKey = _get(CC, 'worldPosition')
+        mpKey = _get(CC, 'mapPosition')
         avKey = _get(CC, 'avatar')
-        if wpKey is None or avKey is None:
+        if mpKey is None or avKey is None:
             return out
         for entity in _try(lambda: dataHub.getEntityCollections('avatar'), []) or []:
             a = _try(lambda e=entity: e[avKey])
@@ -1105,49 +1124,123 @@ class Collector(object):
                 pid = _get(a, 'id')
             if pid is None:
                 continue
-            pos = _component_pos(_try(lambda e=entity: e[wpKey]))
-            if pos:
-                out[pid] = pos
+            comp = _try(lambda e=entity: e[mpKey])
+            if comp is None:
+                continue
+            xy = _point_xy(_get(comp, 'position'))
+            if xy is None:
+                continue
+            out[pid] = (xy[0], xy[1], _get(comp, 'yaw'))
         return out
+
+    @staticmethod
+    def _fit_axis(ms, ws):
+        """Least-squares fit w = a*m + b; returns (a, b, residual) or None."""
+        n = len(ms)
+        if n < 2:
+            return None
+        mean_m = sum(ms) / n
+        mean_w = sum(ws) / n
+        var_m = sum((m - mean_m) ** 2 for m in ms)
+        if var_m <= 1e-6:
+            return None
+        cov = sum((ms[i] - mean_m) * (ws[i] - mean_w) for i in range(n))
+        a = cov / var_m
+        b = mean_w - a * mean_m
+        res = sum((ws[i] - (a * ms[i] + b)) ** 2 for i in range(n))
+        return (a, b, res)
+
+    def _fit_map_transform(self, samples):
+        """Derive the affine mapping minimap-space -> world from ships that expose
+        both. `samples` = [(mapX, mapY, worldX, worldZ), ...].
+
+        Returns ('A'|'B', ax, bx, az, bz) where 'A' means worldX<-mapX, worldZ<-mapY
+        and 'B' means the axes are swapped. We try both and keep the better fit, so
+        we don't have to assume the minimap's axis orientation up front."""
+        if len(samples) < 2:
+            return None
+        mxs = [s[0] for s in samples]
+        mys = [s[1] for s in samples]
+        wxs = [s[2] for s in samples]
+        wzs = [s[3] for s in samples]
+        a_x = self._fit_axis(mxs, wxs)
+        a_z = self._fit_axis(mys, wzs)
+        b_x = self._fit_axis(mys, wxs)
+        b_z = self._fit_axis(mxs, wzs)
+        cands = []
+        if a_x and a_z:
+            cands.append(('A', a_x[2] + a_z[2], a_x, a_z))
+        if b_x and b_z:
+            cands.append(('B', b_x[2] + b_z[2], b_x, b_z))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[1])
+        kind, _res, fx, fz = cands[0]
+        return (kind, fx[0], fx[1], fz[0], fz[1])
+
+    def _map_to_world(self, mx, my):
+        t = self._mapTransform
+        if t is None:
+            return None
+        kind, ax, bx, az, bz = t
+        if kind == 'A':
+            return [ax * mx + bx, 0.0, az * my + bz]
+        return [ax * my + bx, 0.0, az * mx + bz]
 
     def _build_ships(self, now):
         ships = _try(lambda: battle.getAllShips(), []) or []
-        posIndex = self._collect_entity_positions()
+        mapIndex = self._collect_map_positions()   # playerId -> (mapX, mapY, mapYaw)
+
+        # -- pass 1: resolve ids + world positions; calibrate map->world ---------
+        infos = []
+        calib = []
+        for ship in ships:
+            vehId = None
+            for _name in ('_Ship__id', 'id', 'vehicleId'):
+                vehId = _get(ship, _name)
+                if vehId is not None:
+                    break
+            player = _try(lambda: battle.getPlayerByVehicleId(vehId)) if vehId is not None else None
+            pid = _get(player, 'id') if player is not None else None
+            worldPos = self._get_ship_position(ship, pid, vehId)
+            infos.append((ship, vehId, player, pid, worldPos))
+            if worldPos and pid is not None:
+                mp = mapIndex.get(pid)
+                if mp is not None:
+                    calib.append((mp[0], mp[1], worldPos[0], worldPos[2]))
+        t = self._fit_map_transform(calib)
+        if t is not None:
+            self._mapTransform = t   # cache; map->world is constant per battle
+
+        # -- pass 2: build per-ship entries --------------------------------------
         out = []
         seen_keys = set()
         nAlly = 0
         nAllyVis = 0
         nEnemy = 0
         nEnemyVis = 0
-        for ship in ships:
+        for ship, vehId, player, pid, worldPos in infos:
             entry = {}
             entry['uiId'] = _get(ship, 'uiId')
-            # the entity id used by getPlayerByVehicleId varies by build; try a few
-            vehId = None
-            for _name in ('_Ship__id', 'id', 'vehicleId'):
-                vehId = _get(ship, _name)
-                if vehId is not None:
-                    break
             if vehId is not None:
                 entry['vehicleId'] = vehId
             teamId = _get(ship, 'teamId')
             entry['teamId'] = teamId
             entry['relation'] = self._relation(teamId)
             entry['alive'] = _try(lambda: ship.isAlive())
-            # resolve player id early so position lookup can fall back to
-            # battle.getPlayerShipInfo(), which some builds use for spotted enemies
-            player = _try(lambda: battle.getPlayerByVehicleId(vehId)) if vehId is not None else None
             if player is not None:
-                entry['playerId'] = _get(player, 'id')
+                entry['playerId'] = pid
                 if entry.get('teamId') is None:
                     entry['teamId'] = _get(player, 'teamId')
                     entry['relation'] = self._relation(entry['teamId'])
-            pos = self._get_ship_position(ship, entry.get('playerId'), vehId)
-            if not pos:
-                # spotted-but-not-rendered ships (e.g. enemies lit only by a
-                # teammate) have no getPosition(); fall back to the world position
-                # carried on the ship entity, which the minimap also uses.
-                pos = posIndex.get(entry.get('playerId'))
+
+            pos = worldPos
+            mp = mapIndex.get(pid) if pid is not None else None
+            if not pos and mp is not None:
+                # spotted-but-not-rendered ship (e.g. enemy lit only by a teammate):
+                # getPosition() is None, but mapPosition is populated -- convert it
+                # to world coordinates using the calibrated transform.
+                pos = self._map_to_world(mp[0], mp[1])
             if pos:
                 entry['position'] = pos
                 entry['visible'] = True
@@ -1157,6 +1250,9 @@ class Collector(object):
                 v = _get(ship, k)
                 if v is not None:
                     entry[k] = v
+            # spotted-only enemies have no ship.yaw; fall back to mapPosition yaw
+            if entry.get('yaw') is None and mp is not None and mp[2] is not None:
+                entry['yaw'] = mp[2]
             # ship class lives on `subtype` on this build (`shipType` is None)
             shipType = _get(ship, 'shipType')
             if shipType is None:
@@ -1217,6 +1313,8 @@ class Collector(object):
             'enemies': nEnemy,
             'enemiesVisible': nEnemyVis,
             'ghosts': nGhost,
+            'mapCalib': (self._mapTransform[0] if self._mapTransform else None),
+            'mapSamples': len(calib),
         }
 
 

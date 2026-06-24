@@ -483,6 +483,39 @@ class Probe(object):
             if comp is not None:
                 for line in _describe(comp, '       '):
                     self._emit(line)
+                # expand the inner position Point (the actual coordinates source)
+                sub = _get(comp, 'position')
+                if sub is not None:
+                    self._emit('       .position type={} x={} y={} z={} repr={}'.format(
+                        type(sub).__name__, _s(_get(sub, 'x')), _s(_get(sub, 'y')),
+                        _s(_get(sub, 'z')), _safe_call(lambda s=sub: s)))
+
+    def _dump_calibration(self):
+        # For rendered ships we have BOTH getPosition() (world) and the mapPosition
+        # component, so these pairs reveal the minimap->world transform the real
+        # extractor calibrates from. Dump a handful for verification.
+        self._emit('-- CALIBRATION: getPosition(world) vs mapPosition.position --')
+        cc = getattr(constants, 'UiComponents', None)
+        mpKey = getattr(cc, 'mapPosition', None) if cc is not None else None
+        ships = _try(lambda: battle.getAllShips(), []) or []
+        n = 0
+        for ship in ships:
+            if n >= 8:
+                break
+            uiId, vehId = self._ship_ids(ship)
+            pid = self._pid_for(vehId)
+            wp = self._get_pos(ship)
+            ent = self._avatar_entity_for(pid, uiId)
+            mp = None
+            yaw = None
+            if ent is not None and mpKey is not None:
+                comp = _try(lambda e=ent: e[mpKey])
+                pt = _get(comp, 'position')
+                mp = _try(lambda p=pt: [float(p.x), float(p.y)])
+                yaw = _get(comp, 'yaw')
+            self._emit('   team={} pid={} world={} map={} mapYaw={}'.format(
+                _get(ship, 'teamId'), pid, _s(wp), _s(mp), _s(yaw)))
+            n += 1
 
     def _scan_collections_for(self, uiId, vehId, pid):
         self._emit('-- dataHub scan for matching entity (uiId={}, vehId={}, pid={}) --'
@@ -643,6 +676,8 @@ class Probe(object):
         self._flush()
         # Start polling for a spotted-but-not-rendered enemy (the key unknown).
         self._start_hunt()
+        _try(lambda: self._dump_calibration())
+        self._flush()
 
     def _on_quit(self, *args):
         self._stop_hunt()
