@@ -487,6 +487,28 @@ def _point_xy(pt):
         return None
 
 
+def _map_norm_xy(x, y):
+    """Return trusted minimap-normalized [x, y], or None if the source is bogus."""
+    try:
+        nx = float(x)
+        ny = float(y)
+    except:
+        return None
+    if nx != nx or ny != ny:
+        return None
+    if nx < -0.01 or nx > 1.01 or ny < -0.01 or ny > 1.01:
+        return None
+    if nx < 0.0:
+        nx = 0.0
+    elif nx > 1.0:
+        nx = 1.0
+    if ny < 0.0:
+        ny = 0.0
+    elif ny > 1.0:
+        ny = 1.0
+    return [nx, ny]
+
+
 def _looks_like_space(v):
     """True if `v` looks like an internal WoWS space id.
 
@@ -1021,6 +1043,8 @@ class Collector(object):
                 'shipType': entry.get('shipType'),
             },
             'pos': pos,
+            'nx': entry.get('nx'),
+            'ny': entry.get('ny'),
             'yaw': entry.get('yaw'),
             'health': entry.get('health'),
             'ts': now,
@@ -1028,7 +1052,11 @@ class Collector(object):
 
     def _apply_ghost(self, target, seen, now):
         """Attach lastPosition/staleSeconds fields onto target from a cache entry."""
-        target['lastPosition'] = seen['pos']
+        if seen.get('pos') is not None:
+            target['lastPosition'] = seen['pos']
+        if seen.get('nx') is not None and seen.get('ny') is not None:
+            target['lastNx'] = seen['nx']
+            target['lastNy'] = seen['ny']
         if seen.get('yaw') is not None:
             target['lastYaw'] = seen['yaw']
         if seen.get('health') is not None:
@@ -1113,6 +1141,7 @@ class Collector(object):
             return out
         mpKey = _get(CC, 'mapPosition')
         avKey = _get(CC, 'avatar')
+        visKey = _get(CC, 'visibility')
         if mpKey is None or avKey is None:
             return out
         for entity in _try(lambda: dataHub.getEntityCollections('avatar'), []) or []:
@@ -1124,6 +1153,12 @@ class Collector(object):
                 pid = _get(a, 'id')
             if pid is None:
                 continue
+            if visKey is not None:
+                vis = _try(lambda e=entity: e[visKey])
+                # Last-visible markers can keep a stale mapPosition; live state
+                # should only use positions the game currently marks on-map.
+                if vis is not None and _get(vis, 'mapVisible') is False:
+                    continue
             comp = _try(lambda e=entity: e[mpKey])
             if comp is None:
                 continue
@@ -1236,6 +1271,12 @@ class Collector(object):
 
             pos = worldPos
             mp = mapIndex.get(pid) if pid is not None else None
+            norm = _map_norm_xy(mp[0], mp[1]) if mp is not None else None
+            if norm is not None:
+                # mapPosition is already minimap-normalized; this keeps 1v1
+                # enemies drawable even when only self is available to calibrate.
+                entry['nx'] = norm[0]
+                entry['ny'] = norm[1]
             if not pos and mp is not None:
                 # spotted-but-not-rendered ship (e.g. enemy lit only by a teammate):
                 # getPosition() is None, but mapPosition is populated -- convert it
@@ -1243,6 +1284,8 @@ class Collector(object):
                 pos = self._map_to_world(mp[0], mp[1])
             if pos:
                 entry['position'] = pos
+                entry['visible'] = True
+            elif norm is not None:
                 entry['visible'] = True
             else:
                 entry['visible'] = False
@@ -1263,11 +1306,11 @@ class Collector(object):
             rel = entry.get('relation')
             if rel == 2:
                 nEnemy += 1
-                if pos:
+                if pos or norm is not None:
                     nEnemyVis += 1
             elif rel == 1:
                 nAlly += 1
-                if pos:
+                if pos or norm is not None:
                     nAllyVis += 1
 
             key = self._ship_key(entry)
@@ -1278,7 +1321,7 @@ class Collector(object):
                 # sunk ship: drop any ghost memory, no last-seen marker
                 if key is not None and key in self._lastSeen:
                     del self._lastSeen[key]
-            elif pos:
+            elif pos or norm is not None:
                 if key is not None:
                     self._remember(key, entry, pos, now)
             elif key is not None:

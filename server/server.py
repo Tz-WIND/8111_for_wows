@@ -153,6 +153,19 @@ def normalize(pos, bounds):
         return None
 
 
+def normalize_direct(nx, ny):
+    """Pass through trusted minimap-normalized coordinates from the collector."""
+    if not isinstance(nx, (int, float)) or not isinstance(ny, (int, float)):
+        return None
+    if isinstance(nx, bool) or isinstance(ny, bool):
+        return None
+    if not math.isfinite(nx) or not math.isfinite(ny):
+        return None
+    if nx < -0.01 or nx > 1.01 or ny < -0.01 or ny > 1.01:
+        return None
+    return [min(1.0, max(0.0, float(nx))), min(1.0, max(0.0, float(ny)))]
+
+
 def build_map_objects(meta, state, bounds=None):
     if bounds is None:
         bounds = extract_bounds(meta)
@@ -168,6 +181,9 @@ def build_map_objects(meta, state, bounds=None):
         meta_r = roster.get(pid, {})
         pos = s.get("position")
         norm = normalize(pos, bounds)
+        if norm is None:
+            norm = normalize_direct(s.get("nx", s.get("mapX")),
+                                    s.get("ny", s.get("mapY")))
         mh = s.get("maxHealth") or meta_r.get("maxHealth")
         hp = s.get("health")
         team = s.get("teamId")
@@ -187,7 +203,7 @@ def build_map_objects(meta, state, bounds=None):
             "playerName": meta_r.get("name"),
             "tier": meta_r.get("shipTier"),
             "alive": s.get("alive"),
-            "visible": s.get("visible", pos is not None),
+            "visible": s.get("visible", pos is not None or norm is not None),
             "x": pos[0] if pos else None,
             "z": pos[2] if pos else None,
             "yaw": s.get("yaw"),
@@ -203,6 +219,9 @@ def build_map_objects(meta, state, bounds=None):
         if last_pos:
             obj["lastX"], obj["lastZ"] = last_pos[0], last_pos[2]
             lnorm = normalize(last_pos, bounds)
+            if lnorm is None:
+                lnorm = normalize_direct(s.get("lastNx", s.get("lastMapX")),
+                                         s.get("lastNy", s.get("lastMapY")))
             if lnorm:
                 obj["lastNx"], obj["lastNy"] = lnorm[0], lnorm[1]
             if s.get("lastYaw") is not None:
@@ -211,6 +230,17 @@ def build_map_objects(meta, state, bounds=None):
                 obj["lastHealth"] = s.get("lastHealth")
             obj["lastSeenTs"] = s.get("lastSeenTs")
             obj["staleSeconds"] = s.get("staleSeconds")
+        elif s.get("lastNx") is not None or s.get("lastMapX") is not None:
+            lnorm = normalize_direct(s.get("lastNx", s.get("lastMapX")),
+                                     s.get("lastNy", s.get("lastMapY")))
+            if lnorm:
+                obj["lastNx"], obj["lastNy"] = lnorm[0], lnorm[1]
+                if s.get("lastYaw") is not None:
+                    obj["lastYaw"] = s.get("lastYaw")
+                if s.get("lastHealth") is not None:
+                    obj["lastHealth"] = s.get("lastHealth")
+                obj["lastSeenTs"] = s.get("lastSeenTs")
+                obj["staleSeconds"] = s.get("staleSeconds")
 
         objects.append(obj)
     return objects, bounds
