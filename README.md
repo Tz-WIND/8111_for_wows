@@ -193,7 +193,7 @@ HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket �
 | `GET /healthz` | 服务状态：`battleActive`、最后更新 `ageSeconds`、`wsClients` 等 |
 | `GET /all` | **全量合并快照**（meta + state + 归一化对象列表）。WebSocket 推送的也是它 |
 | `GET /map_obj.json` | 所有可见对象数组（归一化 `nx/ny` + 世界 `x/z`、`relation`、`type`、`name`、`hpRatio`、`yaw`…） |
-| `GET /map_info.json` | 地图名、世界边界 `bounds`、`battleType`、`boundsKnown` |
+| `GET /map_info.json` | 地图识别结果：`mapId`（内部空间名）、`mapName`（友好名）、世界边界 `bounds`、`boundsKnown`、`boundsSource`、`battleType` |
 | `GET /state` | 自身舰船状态 |
 | `GET /indicators` | 自身航向/航速/血量/坐标 |
 | `GET /roster` | 完整名单 + 舰种/tier + 消耗品范围 |
@@ -210,18 +210,21 @@ HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket �
   "teamId": 0, "relation": 1,          // relation: 1=友方, 2=敌方
   "type": "Battleship", "name": "PJSB018_Yamato_1944", "playerName": "You", "tier": 10,
   "alive": true, "visible": true,
-  "x": 1500.0, "z": -3200.0,           // 世界坐标（BigWorld）
-  "nx": 0.51, "ny": 0.62,              // 归一化小地图坐标 [0,1]，仅当地图边界已知时出现
+  "x": 200.0, "z": -420.0,             // 世界坐标（BigWorld，原点居中，约 ±600~±1000）
+  "nx": 0.625, "ny": 0.7625,          // 归一化小地图坐标 [0,1]，地图被识别/边界已知时出现
   "yaw": 1.2,                          // 航向（弧度）
   "health": 81000, "maxHealth": 97700, "hpRatio": 0.829
 }
 ```
 
-### 坐标系说明
+### 坐标系与地图识别
 
-- 采集器始终输出**世界坐标** `x/z`（BigWorld 单位）。
-- 若 `meta.json` 提供了地图边界（`minX/maxX/minZ/maxZ` 或 `width/height`），服务端会顺带给出归一化 `nx/ny ∈ [0,1]`（原点左上、北朝上）。
-- 若边界未知（探针没找到对应 API），`map_info.json` 的 `boundsKnown=false`，对象里就没有 `nx/ny`——overlay 会**自动按当前所有舰船位置缩放**（client-side auto-fit），照样能用；等你用探针确认了边界 API 再补到采集器里即可获得精确归一化。
+- 采集器始终输出**世界坐标** `x/z`（BigWorld 单位，所有对战地图都以世界原点 `(0,0)` 居中）。
+- 服务端按下面的优先级给出地图边界，并据此输出归一化 `nx/ny ∈ [0,1]`（原点左上、北朝上）。`map_info.json` 的 `boundsSource` 会告诉你用的是哪一种：
+  1. **`runtime`** —— 采集器在 `meta.map` 里直接给了数值边界（`minX/maxX/minZ/maxZ` 或 `width/height`），优先采用。
+  2. **`table`** —— 采集器给出了游戏内空间名（如 `spaces/13_OC_new_dawn`），服务端用内置的 15.5 地图表（`server/maps.py`）识别为友好名（如 `New Dawn`）并填入该图**精确的、以原点居中的世界边界**。
+  3. 都没有 —— `boundsKnown=false`，对象里没有 `nx/ny`，overlay 退化为**按当前舰船位置自动缩放**（client-side auto-fit），照样能用。
+- `server/maps.py` 由 `tools/gen_maps.py` 从客户端 `space.settings` 自动生成（边界 = `chunk 网格 × <chunkSize>`，默认 100m，已对 15.5 全部对战地图核对、零对称性误差）。换游戏版本后重新解包并重跑生成器即可，详见下文“更新地图表”。
 
 ---
 
@@ -262,9 +265,28 @@ curl http://127.0.0.1:8124/map_obj.json
 
 - **没有 `state.json`**：确认 mod 在 `res_mods/PnFMods/WowsExtractor/`（不是 `mod/` 这层），且 `res_mods/` 下有 `PnFModsLoader.py`；看 `python.log` 有没有 `[WowsExtractor] loaded`。
 - **服务端找不到文件**：确认根目录已有 `config.ini`（从 `config.example.ini` 复制）且 `game_dir` 正确；或用 `--state-file` 直接指定 `python.log` 里打印的那个绝对路径。
-- **overlay 上船都挤在一起 / 位置不准**：多半是地图边界未知走了 auto-fit。跑探针确认边界 API，把 `minX/maxX/minZ/maxZ` 填进采集器的 `_build_map_info()`。
+- **overlay 上船都挤在一起 / 位置不准**：看 `map_info.json` 的 `boundsKnown` 与 overlay HUD 的 Bounds 行。若 `boundsKnown=false`（overlay 显示 `auto-fit`），说明这张图没被识别——多半是采集器没拿到游戏内空间名。确认该客户端版本下 `_build_map_info()` 能取到形如 `13_OC_new_dawn` 的空间名（可用探针对照），或确认它在 `server/maps.py` 表里（新图需按下文重跑生成器）。
 - **某些字段为 null**：该客户端版本的属性名不同。看 `probe_dump.txt` 对照修正属性名（缺字段不会崩，只是为空）。
 - **端口被占用**：`--port` 换一个。
+
+---
+
+## 更新地图表（换游戏版本时）
+
+`server/maps.py` 是由 `tools/gen_maps.py` 从客户端 `space.settings` **自动生成**的（当前对应 15.5，含 50 张对战图）。游戏更新、出新图后按三步重建即可：
+
+```bat
+:: 1) 用官方解包器导出所有 space.settings（用你安装目录里的 build 号）
+wowsunpack.exe "E:\World_of_Warships\bin\<build>\idx" ^
+  -p "E:\World_of_Warships\res_packages" ^
+  -I "*space.settings" -x -o "<解包输出目录>"
+
+:: 2) 把 tools/gen_maps.py 里的 SPACES_DIR 指向上一步产生的 spaces\ 目录
+:: 3) 重新生成 server/maps.py
+uv run python tools/gen_maps.py
+```
+
+原理：`space.settings` 的 `<bounds>` 是**区块网格**坐标，每格大小取 `<chunkSize>`（默认 100m，个别图 300m）；所有对战图都满足 `minX+maxX=-1`（即以世界原点居中），于是世界边界 = `网格 × chunkSize`，可精确换算、无需经验估计。友好显示名优先用内置精选表，缺失的按内部名自动清洗（去掉 `13_`/区域码、下划线转空格）。
 
 ---
 

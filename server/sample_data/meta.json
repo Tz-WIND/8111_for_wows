@@ -4,7 +4,7 @@
   "ts": 5.4,
   "battleType": "RandomBattle",
   "selfPlayerId": 537,
-  "map": {"name": "Trap"},
+  "map": {"name": "spaces/13_OC_new_dawn"},
   "roster": [
     {"playerId": 537, "teamId": 0, "relation": 1, "name": "You",
      "shipType": "Battleship", "shipName": "PJSB018_Yamato_1944", "shipTier": 10,

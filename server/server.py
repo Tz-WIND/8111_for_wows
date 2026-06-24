@@ -40,6 +40,11 @@ from aiohttp import web
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATIC = os.path.join(HERE, "static")
 
+# Sibling module: the generated map-recognition table (tools/gen_maps.py).
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import maps  # noqa: E402
+
 
 # ===========================================================================
 # shared state store
@@ -64,9 +69,12 @@ class Store:
 # ===========================================================================
 # coordinate normalization + view models  (pure functions)
 # ===========================================================================
-def extract_bounds(meta):
-    """Return (minX, maxX, minZ, maxZ) from meta.map, or None if unknown."""
-    m = (meta or {}).get("map") or {}
+def _numeric_bounds(m):
+    """World bounds straight from explicit numbers the mod emitted, or None.
+
+    Prefers explicit min/max (runtime arena data); falls back to width/height.
+    """
+    m = m or {}
 
     def num(*keys):
         for k in keys:
@@ -87,6 +95,51 @@ def extract_bounds(meta):
     return None
 
 
+def resolve_map_info(meta):
+    """Identify the map and its world bounds.
+
+    Combines two sources, in priority order:
+      1. explicit numeric bounds the mod read from the live arena (most exact);
+      2. the generated recognition table keyed by the in-game space name
+         (origin-centred per-map bounds from `space.settings`).
+
+    Returns {id, name, raw, bounds, boundsSource}. bounds is None when the map
+    is unknown and no numbers were provided (the overlay then auto-fits).
+    """
+    m = (meta or {}).get("map") or {}
+    raw = (m.get("id") or m.get("name") or m.get("mapName") or m.get("spaceId")
+           or m.get("geometry") or m.get("geometryName") or m.get("spaceName"))
+    hit = maps.resolve_map(raw)
+
+    bounds = _numeric_bounds(m)
+    source = "runtime" if bounds else None
+    if bounds is None and hit and hit.get("bounds"):
+        bounds = tuple(hit["bounds"])
+        source = "table"
+
+    name = (hit["name"] if hit else None) or m.get("name") or raw
+    map_id = hit["id"] if hit else None
+    return {"id": map_id, "name": name, "raw": raw,
+            "bounds": bounds, "boundsSource": source}
+
+
+def merge_map_out(meta, info):
+    """Merge resolved map identity into the mod's raw map object for API output."""
+    map_out = dict((meta or {}).get("map", {}) or {})
+    if info["id"]:
+        map_out["id"] = info["id"]
+    if info["name"]:
+        map_out["name"] = info["name"]
+    if info.get("raw"):
+        map_out["raw"] = info["raw"]
+    return map_out
+
+
+def extract_bounds(meta):
+    """Return (minX, maxX, minZ, maxZ) for the current map, or None if unknown."""
+    return resolve_map_info(meta)["bounds"]
+
+
 def normalize(pos, bounds):
     """World [x, y, z] -> (nx, ny) in [0,1], origin top-left, north up."""
     if not pos or bounds is None:
@@ -100,8 +153,9 @@ def normalize(pos, bounds):
         return None
 
 
-def build_map_objects(meta, state):
-    bounds = extract_bounds(meta)
+def build_map_objects(meta, state, bounds=None):
+    if bounds is None:
+        bounds = extract_bounds(meta)
     roster = {}
     for r in (meta or {}).get("roster", []) or []:
         pid = r.get("playerId")
@@ -163,14 +217,17 @@ def build_map_objects(meta, state):
 
 
 def build_all(meta, state):
-    objects, bounds = build_map_objects(meta, state)
+    info = resolve_map_info(meta)
+    objects, bounds = build_map_objects(meta, state, info["bounds"])
+    map_out = merge_map_out(meta, info)
     return {
         "schema": 1,
         "active": (state or {}).get("active", False),
         "ts": (state or {}).get("ts"),
         "battleType": (meta or {}).get("battleType"),
-        "map": (meta or {}).get("map", {}),
+        "map": map_out,
         "bounds": list(bounds) if bounds else None,
+        "boundsSource": info["boundsSource"],
         "self": (state or {}).get("self"),
         "objects": objects,
         "roster": (meta or {}).get("roster", []),
@@ -467,12 +524,16 @@ async def h_map_obj(request):
 
 async def h_map_info(request):
     s = request.app["store"]
-    bounds = extract_bounds(s.meta)
+    info = resolve_map_info(s.meta)
+    map_out = merge_map_out(s.meta, info)
     return jr({
-        "map": (s.meta or {}).get("map", {}),
+        "map": map_out,
+        "mapId": info["id"],
+        "mapName": info["name"],
         "battleType": (s.meta or {}).get("battleType"),
-        "bounds": list(bounds) if bounds else None,
-        "boundsKnown": bounds is not None,
+        "bounds": list(info["bounds"]) if info["bounds"] else None,
+        "boundsKnown": info["bounds"] is not None,
+        "boundsSource": info["boundsSource"],
     })
 
 

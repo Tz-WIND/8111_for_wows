@@ -225,7 +225,11 @@ function render() {
       $("allyInfo").textContent = allyN;
       $("enemyInfo").textContent = enemyN;
     }
-    $("boundsMode").textContent = hasServerBounds() ? "from map" : "auto-fit";
+    $("boundsMode").textContent = hasServerBounds()
+      ? (snap.boundsSource === "runtime" ? "from map (live)"
+         : snap.boundsSource === "table" ? "from map (recognized)"
+         : "from map")
+      : "auto-fit";
     const dmg = snap.damage && snap.damage.teamTotal;
     if (dmg && Object.keys(dmg).length) {
       $("scoreLine").textContent = "Team dmg: " +

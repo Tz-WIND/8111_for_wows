@@ -2,17 +2,17 @@
   "schema": 1,
   "active": true,
   "ts": 42.7,
-  "self": {"playerId": 537, "teamId": 0, "position": [1500.0, 0.0, -3200.0],
+  "self": {"playerId": 537, "teamId": 0, "position": [200.0, 0.0, -420.0],
            "yaw": 1.20, "health": 81000, "maxHealth": 97700, "speed": 27.5, "isObserver": false},
   "ships": [
     {"uiId": 1, "vehicleId": 1, "playerId": 537, "teamId": 0, "relation": 1,
-     "alive": true, "visible": true, "position": [1500.0, 0.0, -3200.0], "yaw": 1.20,
+     "alive": true, "visible": true, "position": [200.0, 0.0, -420.0], "yaw": 1.20,
      "health": 81000, "maxHealth": 97700},
     {"uiId": 2, "vehicleId": 2, "playerId": 538, "teamId": 0, "relation": 1,
-     "alive": true, "visible": true, "position": [-4200.0, 0.0, 800.0], "yaw": 2.90,
+     "alive": true, "visible": true, "position": [-450.0, 0.0, 150.0], "yaw": 2.90,
      "health": 19500, "maxHealth": 19700},
     {"uiId": 9, "vehicleId": 9, "playerId": 901, "teamId": 1, "relation": 2,
-     "alive": true, "visible": true, "position": [6100.0, 0.0, 5400.0], "yaw": 4.10,
+     "alive": true, "visible": true, "position": [410.0, 0.0, 480.0], "yaw": 4.10,
      "health": 41000, "maxHealth": 58300}
   ],
   "damage": {

@@ -456,6 +456,25 @@ def _vec(pos):
         return None
 
 
+def _looks_like_space(v):
+    """True if `v` looks like an internal WoWS space id.
+
+    Examples: "spaces/13_OC_new_dawn", "13_OC_new_dawn", "s02_Naval_Defense".
+    The leading token is digits (13) or a letter + digits (s02). This lets the
+    collector pick the recognition key out of a grab-bag of arena attributes,
+    even when one of them is a localized display name instead.
+    """
+    if not isinstance(v, (str, unicode)):
+        return False
+    tail = v.replace('\\', '/').strip().strip('/').rsplit('/', 1)[-1]
+    if '_' not in tail:
+        return False
+    head = tail.split('_', 1)[0]
+    if head.isdigit():
+        return True
+    return len(head) >= 2 and head[0].isalpha() and head[1:].isdigit()
+
+
 # ===========================================================================
 # damage accumulation (mirrors DamageMonitor approach)
 # ===========================================================================
@@ -793,31 +812,50 @@ class Collector(object):
         return meta
 
     def _build_map_info(self):
+        """Collect the map's identity (for server-side recognition) and, when
+        the client exposes them, raw world bounds.
+
+        The server only needs a recognizable space id (e.g. ``13_OC_new_dawn``)
+        to look up exact, origin-centred bounds; numeric bounds here are an
+        optional bonus that takes priority when present. We probe several
+        sources because attribute names vary across client builds -- whichever
+        one carries the space id, the server resolver will match it.
+        """
         info = {}
-        # Try a few likely sources for arena/space bounds. The probe mod helps
-        # confirm which one exists on a given build; all are optional here.
-        arena = _try(lambda: battle.getArenaInfo())
-        if arena is not None:
-            for key in ('name', 'mapName', 'spaceId', 'width', 'height',
-                        'minX', 'maxX', 'minY', 'maxY', 'minZ', 'maxZ'):
-                v = _coerce(_try(lambda: getattr(arena, key)))
+        # String-ish identifiers first, then any numeric bounds we can find.
+        name_keys = ('geometryName', 'geometry', 'mapName', 'spaceName',
+                     'spaceId', 'name', 'mapId', 'arenaName')
+        num_keys = ('width', 'height', 'size', 'worldSize', 'spaceBounds',
+                    'bounds', 'minX', 'maxX', 'minY', 'maxY', 'minZ', 'maxZ')
+
+        def scan(obj):
+            if obj is None:
+                return
+            for key in name_keys + num_keys:
+                if info.get(key) is not None:
+                    continue
+                v = _coerce(_get(obj, key))
                 if v is not None:
                     info[key] = v
-        # dataHub fallback
+
+        # 1) arena info method on `battle`
+        scan(_try(lambda: battle.getArenaInfo()))
+        # 2) the battleInfo component (same entity used for battleType)
+        scan(_try(lambda: dataHub.getSingleEntity('battleInfo')[CC.battleInfo]))
+        # 3) dataHub arena/space entities
         for ename in ('arena', 'arenaInfo', 'minimap', 'space', 'spaceInfo'):
-            ent = _try(lambda: dataHub.getSingleEntity(ename))
+            ent = _try(lambda e=ename: dataHub.getSingleEntity(e))
             if ent is None:
                 continue
-            comp = _try(lambda: ent[getattr(CC, ename)])
-            if comp is None:
-                continue
-            for key in ('spaceBounds', 'bounds', 'size', 'worldSize',
-                        'minX', 'maxX', 'minY', 'maxY', 'minZ', 'maxZ', 'name'):
-                if key in info:
-                    continue
-                v = _coerce(_try(lambda: getattr(comp, key)))
-                if v is not None:
-                    info[key] = v
+            scan(_try(lambda e=ename, x=ent: x[getattr(CC, e)]))
+
+        # Promote the first space-looking value to `id`: the recognition key
+        # the server uses to resolve the friendly name and exact bounds.
+        for key in ('geometryName', 'geometry', 'mapName', 'spaceName',
+                    'spaceId', 'name', 'mapId'):
+            if _looks_like_space(info.get(key)):
+                info['id'] = info[key]
+                break
         return info
 
     def _build_roster(self):
