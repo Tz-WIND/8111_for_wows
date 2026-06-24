@@ -107,9 +107,28 @@ def resolve_map_info(meta):
     is unknown and no numbers were provided (the overlay then auto-fits).
     """
     m = (meta or {}).get("map") or {}
-    raw = (m.get("id") or m.get("name") or m.get("mapName") or m.get("spaceId")
-           or m.get("geometry") or m.get("geometryName") or m.get("spaceName"))
-    hit = maps.resolve_map(raw)
+    candidates = [
+        m.get("id"), m.get("spaceId"), m.get("geometry"), m.get("geometryName"),
+        m.get("spaceName"), m.get("mapPath"), m.get("name"), m.get("mapName"),
+    ]
+    raw = None
+    hit = None
+    for candidate in candidates:
+        if candidate is None or candidate == "":
+            continue
+        if raw is None:
+            raw = candidate
+        hit = maps.resolve_map(candidate)
+        if hit:
+            raw = candidate
+            break
+        for part in str(candidate).replace("\\", "/").split("/"):
+            hit = maps.resolve_map(part)
+            if hit:
+                raw = part
+                break
+        if hit:
+            break
 
     bounds = _numeric_bounds(m)
     source = "runtime" if bounds else None
@@ -117,7 +136,7 @@ def resolve_map_info(meta):
         bounds = tuple(hit["bounds"])
         source = "table"
 
-    name = (hit["name"] if hit else None) or m.get("name") or raw
+    name = (hit["name"] if hit else None) or m.get("name") or m.get("mapName") or raw
     map_id = hit["id"] if hit else None
     return {"id": map_id, "name": name, "raw": raw,
             "bounds": bounds, "boundsSource": source}
@@ -250,11 +269,13 @@ def build_all(meta, state):
     info = resolve_map_info(meta)
     objects, bounds = build_map_objects(meta, state, info["bounds"])
     map_out = merge_map_out(meta, info)
+    battle_type = (meta or {}).get("battleType") or (meta or {}).get("gameMode")
     return {
         "schema": 1,
         "active": (state or {}).get("active", False),
         "ts": (state or {}).get("ts"),
-        "battleType": (meta or {}).get("battleType"),
+        "battleType": battle_type,
+        "gameMode": (meta or {}).get("gameMode"),
         "map": map_out,
         "bounds": list(bounds) if bounds else None,
         "boundsSource": info["boundsSource"],
@@ -556,11 +577,13 @@ async def h_map_info(request):
     s = request.app["store"]
     info = resolve_map_info(s.meta)
     map_out = merge_map_out(s.meta, info)
+    battle_type = (s.meta or {}).get("battleType") or (s.meta or {}).get("gameMode")
     return jr({
         "map": map_out,
         "mapId": info["id"],
         "mapName": info["name"],
-        "battleType": (s.meta or {}).get("battleType"),
+        "battleType": battle_type,
+        "gameMode": (s.meta or {}).get("gameMode"),
         "bounds": list(info["bounds"]) if info["bounds"] else None,
         "boundsKnown": info["bounds"] is not None,
         "boundsSource": info["boundsSource"],

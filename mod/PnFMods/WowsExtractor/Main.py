@@ -88,6 +88,8 @@ except:
 
 STATE_INTERVAL = 0.1          # default seconds between state.json writes (~10 Hz); see config.ini
 LAST_SEEN_TTL = 60.0          # default: keep reporting a dark ship's last-known spot this long; see config.ini
+META_RETRY_INTERVAL = 0.5     # battleInfo/map can be late in very small battles
+META_RETRY_SECONDS = 12.0
 SCHEMA_VERSION = 1
 INVALID = -1
 
@@ -708,6 +710,9 @@ class Collector(object):
         self._selfTeam = _UNSET       # memoized once per snapshot build
         self._stateInterval = STATE_INTERVAL
         self._lastSeenTtl = LAST_SEEN_TTL
+        self._lastMetaWrite = 0.0
+        self._metaRetryUntil = 0.0
+        self._metaReady = False
         self._load_config()
         self._damage = DamageTracker()
         self._ballistics = BallisticsTracker()
@@ -768,15 +773,16 @@ class Collector(object):
         self._damage.clear()
         self._lastSeen = {}
         self._mapTransform = None
+        self._lastMetaWrite = 0.0
+        self._metaRetryUntil = 0.0
+        self._metaReady = False
         self._selfPlayerId = _try(lambda: battle.getSelfPlayerInfo().id)
 
     def _on_battle_shown(self, *args):
         self._active = True
         self._ballistics.start()
-        # write meta now that the roster/consumables are available
-        meta = self._build_meta()
-        _atomic_write(self._metaFile, json_dumps(meta))
-        logInfo('meta.json written ({} players)'.format(len(meta.get('roster', []))))
+        self._metaRetryUntil = _now() + META_RETRY_SECONDS
+        self._refresh_meta(force=True)
         # start the high-frequency state loop
         self._stop_tick()
         self._tickHandle = _try(lambda: callbacks.perTick(self._tick))
@@ -826,6 +832,7 @@ class Collector(object):
     # -- per-frame (throttled) ---------------------------------------------
     def _tick(self, *args):
         now = _now()
+        self._refresh_meta(now)
         if (now - self._lastWrite) < self._stateInterval:
             return
         self._lastWrite = now
@@ -856,20 +863,78 @@ class Collector(object):
         return 1 if teamId == selfTeam else 2
 
     # -- meta (static per battle) ------------------------------------------
+    def _battle_info_component(self):
+        """Return the BattleInfo component from whichever dataHub path is ready."""
+        for getter in (
+                lambda: dataHub.getSingleEntity('battleInfo')[CC.battleInfo],
+                lambda: dataHub.getSingleComponent(CC.battleInfo),
+                lambda: dataHub.getSingleEntity('battleData')[CC.battleInfo]):
+            comp = _try(getter)
+            if comp is not None:
+                return comp
+        for entity in _try(lambda: dataHub.getEntityCollections('battleData'), []) or []:
+            comp = _try(lambda e=entity: e[CC.battleInfo])
+            if comp is not None:
+                return comp
+        return None
+
+    def _meta_has_precise_map(self, info):
+        if not info:
+            return False
+        for key in ('id', 'geometryName', 'geometry', 'spaceName', 'spaceId',
+                    'mapPath', 'mapName', 'name', 'arenaName'):
+            if _looks_like_space(info.get(key)):
+                return True
+        for keys in (('minX', 'maxX', 'minZ', 'maxZ'),
+                     ('minX', 'maxX', 'minY', 'maxY')):
+            ok = True
+            for key in keys:
+                if not isinstance(info.get(key), (int, long, float)):
+                    ok = False
+                    break
+            if ok:
+                return True
+        return False
+
+    def _meta_ready_for_clients(self, meta):
+        mode = meta.get('battleType') or meta.get('gameMode')
+        return bool(mode) and self._meta_has_precise_map(meta.get('map') or {})
+
+    def _refresh_meta(self, now=None, force=False):
+        if self._metaReady and not force:
+            return
+        if now is None:
+            now = _now()
+        if (not force) and self._metaRetryUntil and now > self._metaRetryUntil:
+            return
+        if (not force) and (now - self._lastMetaWrite) < META_RETRY_INTERVAL:
+            return
+        meta = self._build_meta()
+        _atomic_write(self._metaFile, json_dumps(meta))
+        self._lastMetaWrite = now
+        self._metaReady = self._meta_ready_for_clients(meta)
+        if force or self._metaReady:
+            logInfo('meta.json written ({} players, ready={})'.format(
+                len(meta.get('roster', [])), self._metaReady))
+
     def _build_meta(self):
         self._selfTeam = _UNSET
+        battleInfo = self._battle_info_component()
+        battleType = _coerce(_get(battleInfo, 'battleType'))
+        gameMode = _coerce(_get(battleInfo, 'gameMode'))
         meta = {
             'schema': SCHEMA_VERSION,
             'mod': {'name': MOD_NAME, 'version': MOD_VERSION},
             'ts': _now(),
-            'battleType': _try(lambda: dataHub.getSingleEntity('battleInfo')[CC.battleInfo].battleType),
+            'battleType': battleType or gameMode,
+            'gameMode': gameMode,
             'selfPlayerId': self._selfPlayerId,
-            'map': self._build_map_info(),
+            'map': self._build_map_info(battleInfo),
             'roster': self._build_roster(),
         }
         return meta
 
-    def _build_map_info(self):
+    def _build_map_info(self, battleInfo=None):
         """Collect the map's identity (for server-side recognition) and, when
         the client exposes them, raw world bounds.
 
@@ -882,7 +947,7 @@ class Collector(object):
         info = {}
         # String-ish identifiers first, then any numeric bounds we can find.
         name_keys = ('geometryName', 'geometry', 'mapName', 'spaceName',
-                     'spaceId', 'name', 'mapId', 'arenaName')
+                     'spaceId', 'mapPath', 'name', 'mapId', 'arenaName')
         num_keys = ('width', 'height', 'size', 'worldSize', 'spaceBounds',
                     'bounds', 'minX', 'maxX', 'minY', 'maxY', 'minZ', 'maxZ')
 
@@ -899,8 +964,11 @@ class Collector(object):
         # 1) arena info method on `battle`
         scan(_try(lambda: battle.getArenaInfo()))
         # 2) the battleInfo component (same entity used for battleType)
-        scan(_try(lambda: dataHub.getSingleEntity('battleInfo')[CC.battleInfo]))
-        # 3) dataHub arena/space entities
+        scan(battleInfo if battleInfo is not None else self._battle_info_component())
+        # 3) mapInfo and dataHub arena/space entities
+        mapId = info.get('mapId')
+        mapEnt = _try(lambda: dataHub.getPrimaryEntity(CC.mapInfo, mapId))
+        scan(_try(lambda: mapEnt[CC.mapInfo]))
         for ename in ('arena', 'arenaInfo', 'minimap', 'space', 'spaceInfo'):
             ent = _try(lambda e=ename: dataHub.getSingleEntity(e))
             if ent is None:
@@ -910,7 +978,7 @@ class Collector(object):
         # Promote the first space-looking value to `id`: the recognition key
         # the server uses to resolve the friendly name and exact bounds.
         for key in ('geometryName', 'geometry', 'mapName', 'spaceName',
-                    'spaceId', 'name', 'mapId'):
+                    'spaceId', 'mapPath', 'name', 'mapId'):
             if _looks_like_space(info.get(key)):
                 info['id'] = info[key]
                 break
