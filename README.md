@@ -147,6 +147,8 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 | `game_dir` | — | 游戏安装目录，自动定位 `state.json`（原来写在 `run_server.bat` 里的路径搬到这里了） |
 | `host` | `127.0.0.1` | 监听地址 |
 | `port` | `8111` | 监听端口（和战雷冲突就改掉） |
+| `allow_remote` | `false` | 是否允许监听非本机地址（如 `0.0.0.0` 或局域网 IP）；默认拒绝，避免把遥测暴露到局域网 |
+| `allowed_origins` | 本机常见 Origin | 浏览器 Origin 白名单，逗号分隔，同时用于 HTTP CORS 与 WebSocket 握手。留空时仅允许 `127.0.0.1` / `localhost` / `[::1]` 对应端口；设为 `*` 才恢复任意网页可跨域读取 |
 | `poll_interval` | `0.1` | 文件轮询间隔（秒），建议 ≤ 采集器的 `state_interval` |
 | `state_file` / `meta_file` | — | 可选：跳过自动查找，直接指定文件路径 |
 
@@ -174,6 +176,8 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 | `--poll-interval` | `0.1` | 文件轮询间隔（秒） |
 | `--static-dir` | `server/static` | overlay 等静态文件目录 |
 | `--demo` | 关 | 用合成数据跑，不需要游戏 |
+| `--allow-remote` | 关 | 允许监听非本机地址；不加时 `--host 0.0.0.0` 会被拒绝 |
+| `--allowed-origin` | 本机常见 Origin | 添加一个允许的浏览器 Origin，用于 HTTP CORS 与 WebSocket 握手；可重复传。传 `--allowed-origin "*"` 会恢复通配行为 |
 
 > 表中"默认"列指**既没传命令行、`config.ini` 里也没设**时的内置值。
 
@@ -181,7 +185,7 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 
 ## HTTP API
 
-所有 JSON 端点都带 `Access-Control-Allow-Origin: *`，可被任意网页直接 `fetch`。
+HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket 握手也会校验浏览器传来的 `Origin`。同源访问（例如内置 `/overlay`）不受影响；非浏览器客户端没有 `Origin` 时仍可连接。若确实要让其它网页跨域读取，可在 `config.ini` 里设置 `allowed_origins`，或用 `--allowed-origin` 传入明确的 Origin。
 
 | 端点 | 说明 |
 | --- | --- |

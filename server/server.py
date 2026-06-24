@@ -27,6 +27,7 @@ Run (via uv):
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import math
 import os
@@ -319,14 +320,108 @@ async def demo_generator(app, interval):
 # ===========================================================================
 # HTTP / WebSocket handlers
 # ===========================================================================
+def is_loopback_host(host):
+    if not host:
+        return False
+    host = str(host).strip().strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def default_allowed_origins(port):
+    return {
+        "http://127.0.0.1:%d" % port,
+        "http://localhost:%d" % port,
+        "http://[::1]:%d" % port,
+    }
+
+
+def parse_allowed_origins(raw, port):
+    if raw is None or raw == "":
+        return default_allowed_origins(port)
+    if isinstance(raw, (list, tuple, set)):
+        parts = raw
+    else:
+        parts = str(raw).split(",")
+    origins = set()
+    for item in parts:
+        origin = str(item).strip().rstrip("/")
+        if not origin:
+            continue
+        if origin.lower() in ("none", "off", "false"):
+            continue
+        origins.add(origin)
+    return origins
+
+
+def parse_bool(raw, default=False):
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    val = str(raw).strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def origin_allowed(origin, allowed_origins):
+    if not origin:
+        return False
+    normalized = origin.strip().rstrip("/")
+    return "*" in allowed_origins or normalized in allowed_origins
+
+
+def append_vary(resp, value):
+    existing = resp.headers.get("Vary")
+    if not existing:
+        resp.headers["Vary"] = value
+        return
+    parts = [p.strip() for p in existing.split(",")]
+    if value.lower() not in [p.lower() for p in parts]:
+        resp.headers["Vary"] = existing + ", " + value
+
+
+def apply_cors_headers(request, resp):
+    origin = request.headers.get("Origin")
+    allowed_origins = request.app["config"].get("allowed_origins", set())
+    if not origin_allowed(origin, allowed_origins):
+        return False
+    resp.headers["Access-Control-Allow-Origin"] = (
+        "*" if "*" in allowed_origins else origin.strip().rstrip("/")
+    )
+    if "*" not in allowed_origins:
+        append_vary(resp, "Origin")
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    req_headers = request.headers.get("Access-Control-Request-Headers")
+    if req_headers:
+        resp.headers["Access-Control-Allow-Headers"] = req_headers
+    return True
+
+
 @web.middleware
 async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        if request.headers.get("Origin") and not origin_allowed(
+                request.headers.get("Origin"),
+                request.app["config"].get("allowed_origins", set())):
+            return web.Response(status=403)
+        resp = web.Response(status=204)
+        apply_cors_headers(request, resp)
+        resp.headers.setdefault("Cache-Control", "no-store")
+        return resp
     try:
         resp = await handler(request)
     except web.HTTPException as ex:
-        ex.headers["Access-Control-Allow-Origin"] = "*"
+        apply_cors_headers(request, ex)
         raise
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    apply_cors_headers(request, resp)
     resp.headers.setdefault("Cache-Control", "no-store")
     return resp
 
@@ -431,6 +526,10 @@ async def h_debug(request):
 
 
 async def h_ws(request):
+    origin = request.headers.get("Origin")
+    if origin and not origin_allowed(
+            origin, request.app["config"].get("allowed_origins", set())):
+        raise web.HTTPForbidden(text="WebSocket Origin not allowed")
     store = request.app["store"]
     ws = web.WebSocketResponse(heartbeat=20.0)
     await ws.prepare(request)
@@ -459,7 +558,7 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .tag{display:inline-block;min-width:135px;font-weight:600}
 </style></head><body>
 <h1>8111 for World of Warships</h1>
-<p>Local telemetry bridge (aiohttp). Endpoints (JSON, <code>Access-Control-Allow-Origin: *</code>):</p>
+<p>Local telemetry bridge (aiohttp). Browser origins are checked for HTTP CORS and WebSocket handshakes.</p>
 <ul>
  <li><span class="tag"><a href="/all">/all</a></span> full merged snapshot</li>
  <li><span class="tag"><a href="/map_obj.json">/map_obj.json</a></span> all visible objects (normalized + world coords)</li>
@@ -525,6 +624,8 @@ def find_state_file(game_dir):
 
 
 def build_app(config):
+    config = dict(config)
+    config.setdefault("allowed_origins", set())
     app = web.Application(middlewares=[cors_middleware])
     app["store"] = Store()
     app["config"] = config
@@ -585,6 +686,10 @@ def parse_args(argv):
     p.add_argument("--poll-interval", type=float, default=None, help="file poll interval (s)")
     p.add_argument("--static-dir", default=None)
     p.add_argument("--demo", action="store_true", help="serve synthetic data (no game needed)")
+    p.add_argument("--allow-remote", action="store_true", default=None,
+                   help="allow listening on non-loopback hosts such as 0.0.0.0")
+    p.add_argument("--allowed-origin", action="append", default=None,
+                   help="CORS origin to allow; repeat or use config allowed_origins")
     return p.parse_args(argv)
 
 
@@ -616,11 +721,22 @@ def main(argv=None):
     game_dir = pick(args.game_dir, "game_dir", None)
     state_file = pick(args.state_file, "state_file", None)
     meta_file = pick(args.meta_file, "meta_file", None)
+    allow_remote = (args.allow_remote if args.allow_remote is not None
+                    else parse_bool(file_cfg.get("allow_remote"), False))
+    allowed_origins = parse_allowed_origins(
+        args.allowed_origin if args.allowed_origin is not None else file_cfg.get("allowed_origins"),
+        port)
+
+    if not is_loopback_host(host) and not allow_remote:
+        print("ERROR: refusing to listen on non-loopback host %r by default." % host)
+        print("       Use --allow-remote or set allow_remote = true if you intend LAN access.")
+        return 2
 
     if args.demo:
         source_desc = "DEMO (synthetic data)"
         config = {"demo": True, "interval": max(poll_interval, 0.05),
-                  "static_dir": static_dir, "state_file": None, "meta_file": None}
+                  "static_dir": static_dir, "state_file": None, "meta_file": None,
+                  "allowed_origins": allowed_origins}
     else:
         if not state_file and game_dir:
             state_file = find_state_file(game_dir)
@@ -634,7 +750,8 @@ def main(argv=None):
             meta_file = os.path.join(os.path.dirname(state_file), "meta.json")
         source_desc = "state=%s" % state_file
         config = {"demo": False, "interval": max(poll_interval, 0.02),
-                  "static_dir": static_dir, "state_file": state_file, "meta_file": meta_file}
+                  "static_dir": static_dir, "state_file": state_file, "meta_file": meta_file,
+                  "allowed_origins": allowed_origins}
 
     print("=" * 64)
     print(" 8111 for WoWS (aiohttp)  --  http://%s:%d/" % (host, port))
@@ -642,6 +759,9 @@ def main(argv=None):
     print(" websocket:      ws://%s:%d/ws" % (host, port))
     print(" config:         %s" % (config_path if cfg_loaded else "%s (not found, using defaults)" % config_path))
     print(" source:         %s" % source_desc)
+    print(" CORS origins:   %s" % (", ".join(sorted(allowed_origins)) if allowed_origins else "(none)"))
+    if "*" in allowed_origins:
+        print("[warn] CORS wildcard enabled; any webpage can read this local telemetry endpoint.")
     print("=" * 64)
 
     app = build_app(config)
