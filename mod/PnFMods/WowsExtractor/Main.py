@@ -456,6 +456,23 @@ def _vec(pos):
         return None
 
 
+def _component_pos(comp):
+    """Extract [x, y, z] from a dataHub position component (e.g. worldPosition).
+
+    The component may itself behave like a Vector3, or wrap the coordinates under
+    a sub-attribute, so probe both shapes defensively."""
+    if comp is None:
+        return None
+    pos = _vec(comp)
+    if pos:
+        return pos
+    for attr in ('position', 'worldPosition', 'point', 'value', 'pos', 'coords'):
+        pos = _vec(_get(comp, attr))
+        if pos:
+            return pos
+    return None
+
+
 def _looks_like_space(v):
     """True if `v` looks like an internal WoWS space id.
 
@@ -1000,20 +1017,102 @@ class Collector(object):
         target['lastSeenTs'] = seen['ts']
         target['staleSeconds'] = now - seen['ts']
 
-    def _get_ship_position(self, ship):
-        """Try multiple sources to get a ship's world position.
-        Different WoWS builds expose position via different APIs."""
-        for getter in (lambda: ship.getPosition(),
-                       lambda: ship.position,
-                       lambda: ship.worldPosition,
-                       lambda: ship.positionHull):
+    def _position_from_obj(self, obj):
+        """Extract world position from a ship-like object or mapping."""
+        if obj is None:
+            return None
+        for getter in (lambda: obj.getPosition() if hasattr(obj, 'getPosition') else None,
+                       lambda: obj.position,
+                       lambda: obj.worldPosition,
+                       lambda: obj.positionHull):
             pos = _vec(_try(getter))
             if pos:
                 return pos
+        gd = _get(obj, 'shipGameData')
+        if gd is not None:
+            for key in ('position', 'worldPosition'):
+                if _is_mapping(gd):
+                    pos = _vec(_try(lambda k=key: gd[k]))
+                else:
+                    pos = _vec(_try(lambda k=key: getattr(gd, k)))
+                if pos:
+                    return pos
+            if _is_mapping(gd):
+                try:
+                    if gd.get('x') is not None and gd.get('z') is not None:
+                        y = gd.get('y', 0.0)
+                        return [float(gd['x']), float(y), float(gd['z'])]
+                except:
+                    pass
+        if _is_mapping(obj):
+            for key in ('position', 'worldPosition'):
+                pos = _vec(_try(lambda k=key: obj[k]))
+                if pos:
+                    return pos
         return None
+
+    def _get_ship_position(self, ship, playerId=None, vehId=None):
+        """Try multiple sources to get a ship's world position.
+        Different WoWS builds expose position via different APIs; spotted enemies
+        in particular may only be reachable through getPlayerShipInfo()."""
+        pos = self._position_from_obj(ship)
+        if pos:
+            return pos
+        if playerId is not None:
+            for getter in (lambda: battle.getPlayerShipInfo(playerId),
+                           lambda: battle.getPlayerInfo(playerId)):
+                pos = self._position_from_obj(_try(getter))
+                if pos:
+                    return pos
+        if vehId is not None:
+            player = _try(lambda: battle.getPlayerByVehicleId(vehId))
+            if player is not None:
+                pos = self._position_from_obj(player)
+                if pos:
+                    return pos
+                pid = _get(player, 'id')
+                if pid is not None and pid != playerId:
+                    for getter in (lambda: battle.getPlayerShipInfo(pid),
+                                   lambda: battle.getPlayerInfo(pid)):
+                        pos = self._position_from_obj(_try(getter))
+                        if pos:
+                            return pos
+        return None
+
+    def _collect_entity_positions(self):
+        """Map playerId -> world position read from each ship entity's
+        worldPosition component.
+
+        ship.getPosition() / shipGameData.position only return a value for ships
+        rendered inside our own 3D bubble. Enemies spotted by a teammate appear on
+        the minimap but have no such position (getPosition() is None). Their
+        coordinates still live on the ship entity's worldPosition component
+        (UiComponents.worldPosition), so we read it directly here to make every
+        spotted ship show up on the overlay."""
+        out = {}
+        if CC is None:
+            return out
+        wpKey = _get(CC, 'worldPosition')
+        avKey = _get(CC, 'avatar')
+        if wpKey is None or avKey is None:
+            return out
+        for entity in _try(lambda: dataHub.getEntityCollections('avatar'), []) or []:
+            a = _try(lambda e=entity: e[avKey])
+            if a is None:
+                continue
+            pid = _get(a, 'playerId')
+            if pid is None:
+                pid = _get(a, 'id')
+            if pid is None:
+                continue
+            pos = _component_pos(_try(lambda e=entity: e[wpKey]))
+            if pos:
+                out[pid] = pos
+        return out
 
     def _build_ships(self, now):
         ships = _try(lambda: battle.getAllShips(), []) or []
+        posIndex = self._collect_entity_positions()
         out = []
         seen_keys = set()
         nAlly = 0
@@ -1035,23 +1134,35 @@ class Collector(object):
             entry['teamId'] = teamId
             entry['relation'] = self._relation(teamId)
             entry['alive'] = _try(lambda: ship.isAlive())
-            pos = self._get_ship_position(ship)
-            if pos:
-                entry['position'] = pos
-                entry['visible'] = True
-            else:
-                entry['visible'] = False
-            for k in ('yaw', 'health', 'maxHealth', 'name', 'shipType'):
-                v = _get(ship, k)
-                if v is not None:
-                    entry[k] = v
-            # link to player roster (name/type) by vehicle id
+            # resolve player id early so position lookup can fall back to
+            # battle.getPlayerShipInfo(), which some builds use for spotted enemies
             player = _try(lambda: battle.getPlayerByVehicleId(vehId)) if vehId is not None else None
             if player is not None:
                 entry['playerId'] = _get(player, 'id')
                 if entry.get('teamId') is None:
                     entry['teamId'] = _get(player, 'teamId')
                     entry['relation'] = self._relation(entry['teamId'])
+            pos = self._get_ship_position(ship, entry.get('playerId'), vehId)
+            if not pos:
+                # spotted-but-not-rendered ships (e.g. enemies lit only by a
+                # teammate) have no getPosition(); fall back to the world position
+                # carried on the ship entity, which the minimap also uses.
+                pos = posIndex.get(entry.get('playerId'))
+            if pos:
+                entry['position'] = pos
+                entry['visible'] = True
+            else:
+                entry['visible'] = False
+            for k in ('yaw', 'health', 'maxHealth', 'name'):
+                v = _get(ship, k)
+                if v is not None:
+                    entry[k] = v
+            # ship class lives on `subtype` on this build (`shipType` is None)
+            shipType = _get(ship, 'shipType')
+            if shipType is None:
+                shipType = _get(ship, 'subtype')
+            if shipType is not None:
+                entry['shipType'] = shipType
             # track ally/enemy visibility counts for diagnostics
             rel = entry.get('relation')
             if rel == 2:

@@ -54,6 +54,58 @@ def _s(v):
             return '<unprintable>'
 
 
+def _try(fn, default=None):
+    try:
+        return fn()
+    except:
+        return default
+
+
+_UNSET_PROBE = object()
+
+
+def _get(obj, name, default=None):
+    try:
+        return getattr(obj, name)
+    except:
+        return default
+
+
+def _safe_call(fn):
+    try:
+        return repr(fn())
+    except Exception, e:
+        return '<error: {}>'.format(_s(e))
+
+
+def _vec_probe(pos):
+    if pos is None:
+        return None
+    try:
+        return [float(pos.x), float(pos.y), float(pos.z)]
+    except:
+        pass
+    try:
+        return [float(pos[0]), float(pos[1]), float(pos[2])]
+    except:
+        return None
+
+
+def _component_pos_probe(comp):
+    """Mirror of the extractor's _component_pos: pull [x,y,z] from a position
+    component, whether it is itself vector-like or wraps one under a sub-attr."""
+    if comp is None:
+        return None
+    v = _vec_probe(comp)
+    if v:
+        return v
+    for attr in ('position', 'worldPosition', 'point', 'value', 'pos', 'coords'):
+        v = _vec_probe(_get(comp, attr))
+        if v:
+            return v
+    return None
+
+
 def _safe_dir(obj):
     try:
         return [a for a in dir(obj) if not a.startswith('__')]
@@ -104,8 +156,16 @@ CANDIDATE_SINGLE = [
 class Probe(object):
     def __init__(self):
         self._lines = []
+        # spotted-enemy hunter state (find how to read minimap positions)
+        self._captured = False
+        self._dumpedKinds = set()
+        self._huntTicks = 0
+        self._lastHunt = 0.0
+        self._huntHandle = None
+        self._selfTeam = None
         events.onBattleStart(self._on_start)
         events.onBattleShown(self._on_shown)
+        events.onBattleQuit(self._on_quit)
         logInfo('WowsProbe loaded. Will dump API surface on battle start.')
 
     # -- output helpers -----------------------------------------------------
@@ -114,14 +174,9 @@ class Probe(object):
         logInfo(line)
 
     def _flush(self):
-        if os is None:
-            self._emit('[probe] os unavailable -- cannot write dump file.')
-            return
-        try:
-            mod_dir = utils.getModDir()
-        except Exception, e:
-            self._emit('[probe] utils.getModDir() failed: {}'.format(_s(e)))
-            return
+        # `os` may be missing in the sandbox, but plain open() still works, so we
+        # no longer bail on os is None (the previous behaviour suppressed the file).
+        mod_dir = _try(lambda: utils.getModDir(), '.') or '.'
         path = mod_dir + '/probe_dump.txt'
         try:
             f = open(path, 'w')
@@ -129,7 +184,10 @@ class Probe(object):
                 f.write('\n'.join([_s(l) for l in self._lines]))
             finally:
                 f.close()
-            logInfo('[probe] WROTE DUMP -> {}'.format(os.path.abspath(path)))
+            ap = path
+            if os is not None:
+                ap = _try(lambda: os.path.abspath(path), path)
+            logInfo('[probe] WROTE DUMP -> {}'.format(ap))
         except Exception, e:
             logInfo('[probe] FAILED to write dump file at {}: {}'.format(path, _s(e)))
 
@@ -224,6 +282,52 @@ class Probe(object):
                 for line in _describe(v, '    '):
                     self._emit(line)
 
+    def _probe_ship(self, ship, title):
+        self._emit('-- {} --'.format(title))
+        for line in _describe(ship, '    '):
+            self._emit(line)
+        for label, fn in (
+            ('getPosition()', lambda: ship.getPosition()),
+            ('teamId', lambda: ship.teamId),
+            ('uiId', lambda: ship.uiId),
+            ('isAlive()', lambda: ship.isAlive()),
+            ('isVisible', lambda: ship.isVisible),
+            ('isShipVisible', lambda: ship.isShipVisible),
+            ('shipGameData', lambda: ship.shipGameData),
+        ):
+            try:
+                self._emit('    {} = {}'.format(label, _s(fn())))
+            except Exception, e:
+                self._emit('    {} : <error {}>'.format(label, _s(e)))
+        vehId = None
+        for name in ('_Ship__id', 'id', 'vehicleId'):
+            try:
+                vehId = getattr(ship, name)
+                if vehId is not None:
+                    break
+            except:
+                pass
+        if vehId is not None:
+            try:
+                player = battle.getPlayerByVehicleId(vehId)
+                self._emit('    getPlayerByVehicleId({}) = {} ({})'.format(
+                    vehId, _s(player), type(player).__name__))
+                if player is not None:
+                    pid = getattr(player, 'id', None)
+                    if pid is not None:
+                        for label, fn in (
+                            ('getPlayerShipInfo({})'.format(pid),
+                             lambda: battle.getPlayerShipInfo(pid)),
+                            ('getPlayerInfo({})'.format(pid),
+                             lambda: battle.getPlayerInfo(pid)),
+                        ):
+                            try:
+                                self._emit('    {} = {}'.format(label, _s(fn())))
+                            except Exception, e:
+                                self._emit('    {} : <error {}>'.format(label, _s(e)))
+            except Exception, e:
+                self._emit('    getPlayerByVehicleId : <error {}>'.format(_s(e)))
+
     def _dump_ships(self):
         self._emit('==================== battle.getAllShips() ====================')
         try:
@@ -237,25 +341,27 @@ class Probe(object):
             n = '?'
         self._emit('getAllShips -> {} ships'.format(n))
         try:
+            selfTeam = None
+            try:
+                selfTeam = battle.getSelfPlayerInfo().teamId
+            except:
+                pass
             first = None
+            firstEnemy = None
             for s in ships:
-                first = s
-                break
+                if first is None:
+                    first = s
+                try:
+                    if selfTeam is not None and s.teamId != selfTeam and firstEnemy is None:
+                        firstEnemy = s
+                except:
+                    pass
             if first is not None:
-                self._emit('-- first ship attributes --')
-                for line in _describe(first, '    '):
-                    self._emit(line)
-                # probe common accessors explicitly
-                for label, fn in (
-                    ('getPosition()', lambda: first.getPosition()),
-                    ('teamId', lambda: first.teamId),
-                    ('uiId', lambda: first.uiId),
-                    ('isAlive()', lambda: first.isAlive()),
-                ):
-                    try:
-                        self._emit('    {} = {}'.format(label, _s(fn())))
-                    except Exception, e:
-                        self._emit('    {} : <error {}>'.format(label, _s(e)))
+                self._probe_ship(first, 'first ship attributes')
+            if firstEnemy is not None:
+                self._probe_ship(firstEnemy, 'first ENEMY ship attributes')
+            elif selfTeam is not None:
+                self._emit('-- no enemy ship found in getAllShips() (selfTeam={}) --'.format(selfTeam))
         except Exception, e:
             self._emit('  <ship dump error: {}>'.format(_s(e)))
 
@@ -269,6 +375,248 @@ class Probe(object):
                 self._emit('{} -> {}'.format(label, _s(fn())))
             except Exception, e:
                 self._emit('{} : <error {}>'.format(label, _s(e)))
+
+    # -- spotted-enemy hunter ----------------------------------------------
+    # The hard case for telemetry is an enemy that is SPOTTED (drawn on the
+    # in-game minimap because a teammate sees it) but NOT rendered in our own
+    # 3D bubble: ship.getPosition() works only for rendered ships, so those
+    # enemies have no position. This hunter polls every battle, finds such an
+    # enemy, and dumps every candidate source of its position/visibility so we
+    # can wire the real collector to the right API on THIS client build.
+    def _ship_ids(self, ship):
+        uiId = _get(ship, 'uiId')
+        vehId = None
+        for name in ('_Ship__id', 'id', 'vehicleId'):
+            v = _get(ship, name)
+            if v is not None:
+                vehId = v
+                break
+        return uiId, vehId
+
+    def _pid_for(self, vehId):
+        if vehId is None:
+            return None
+        p = _try(lambda: battle.getPlayerByVehicleId(vehId))
+        if p is None:
+            return None
+        return _get(p, 'id')
+
+    def _ship_game_data(self, ship, pid):
+        for getter in (
+            lambda: ship.shipGameData,
+            lambda: battle.getPlayerInfo(pid)['shipGameData'],
+            lambda: battle.getPlayerInfo(pid).shipGameData,
+        ):
+            gd = _try(getter)
+            if gd is not None:
+                return gd
+        return None
+
+    def _gd_get(self, gd, key):
+        if gd is None:
+            return None
+        v = _try(lambda: gd[key])
+        if v is not None:
+            return v
+        return _try(lambda: getattr(gd, key))
+
+    def _get_pos(self, ship):
+        p = _try(lambda: ship.getPosition())
+        if p is None:
+            return None
+        return _try(lambda: [float(p.x), float(p.y), float(p.z)])
+
+    def _visibility(self, ship, gd):
+        vis = self._gd_get(gd, 'isVisible')
+        if vis is None:
+            vis = _get(ship, 'isVisible')
+        shipVis = self._gd_get(gd, 'isShipVisible')
+        if shipVis is None:
+            shipVis = _get(ship, 'isShipVisible')
+        return vis, shipVis
+
+    def _avatar_entity_for(self, pid, uiId):
+        cc = getattr(constants, 'UiComponents', None)
+        avKey = getattr(cc, 'avatar', None) if cc is not None else None
+        if avKey is None:
+            return None
+        for ent in (_try(lambda: list(dataHub.getEntityCollections('avatar'))) or []):
+            comp = _try(lambda e=ent: e[avKey])
+            if comp is None:
+                continue
+            cid = _get(comp, 'playerId')
+            if cid is None:
+                cid = _get(comp, 'id')
+            if cid is not None and cid == pid:
+                return ent
+        return None
+
+    def _entity_comp_pos(self, pid, uiId, compName):
+        ent = self._avatar_entity_for(pid, uiId)
+        if ent is None:
+            return None
+        cc = getattr(constants, 'UiComponents', None)
+        key = getattr(cc, compName, None) if cc is not None else None
+        if key is None:
+            return None
+        return _component_pos_probe(_try(lambda e=ent, k=key: e[k]))
+
+    def _dump_position_components(self, pid, uiId):
+        # THE answer source: every ship entity carries worldPosition / mapPosition
+        # / minimapMarker / mapProjection components. getPosition() is None for a
+        # spotted-but-not-rendered enemy, but these components may still hold its
+        # coordinates -- this is what the extractor fix now reads.
+        self._emit('-- POSITION COMPONENTS (entity worldPosition/mapPosition/...) --')
+        ent = self._avatar_entity_for(pid, uiId)
+        if ent is None:
+            self._emit('   (no avatar entity matched pid={} uiId={})'.format(pid, uiId))
+            return
+        cc = getattr(constants, 'UiComponents', None)
+        for cname in ('worldPosition', 'mapPosition', 'minimapMarker',
+                      'mapProjection', 'distance'):
+            key = getattr(cc, cname, None) if cc is not None else None
+            comp = _try(lambda e=ent, k=key: e[k]) if key is not None else None
+            self._emit('   [{}] key={} type={} repr={}'.format(
+                cname, key, type(comp).__name__, _safe_call(lambda c=comp: c)))
+            self._emit('   [{}] extracted_vec = {}'.format(
+                cname, _s(_component_pos_probe(comp))))
+            if comp is not None:
+                for line in _describe(comp, '       '):
+                    self._emit(line)
+
+    def _scan_collections_for(self, uiId, vehId, pid):
+        self._emit('-- dataHub scan for matching entity (uiId={}, vehId={}, pid={}) --'
+                   .format(uiId, vehId, pid))
+        cc = getattr(constants, 'UiComponents', None)
+        names = list(CANDIDATE_COLLECTIONS)
+        for a in _safe_dir(cc):           # also try every component key as a collection name
+            if a not in names:
+                names.append(a)
+        wanted = set([x for x in (uiId, vehId, pid) if x is not None])
+        for name in names:
+            coll = _try(lambda n=name: dataHub.getEntityCollections(n))
+            if coll is None:
+                continue
+            items = _try(lambda c=coll: list(c))
+            if not items:
+                continue
+            comp_key = getattr(cc, name, None) if cc is not None else None
+            if comp_key is None:
+                continue
+            for ent in items:
+                comp = _try(lambda e=ent, k=comp_key: e[k])
+                if comp is None:
+                    continue
+                refs = set()
+                for idk in ('playerId', 'uiId', 'vehicleId', 'id', 'shipId'):
+                    v = _get(comp, idk)
+                    if v is not None:
+                        refs.add(v)
+                if not (refs & wanted):
+                    continue
+                self._emit('  [match] collection={} comp={}'.format(name, type(comp).__name__))
+                for line in _describe(comp, '      '):
+                    self._emit(line)
+                for posk in ('position', 'worldPosition', 'point', 'coords', 'x', 'y', 'z'):
+                    val = _get(comp, posk, _UNSET_PROBE)
+                    if val is not _UNSET_PROBE:
+                        self._emit('      {}.{} = {}'.format(name, posk, _s(val)))
+
+    def _deep_dump_enemy(self, ship, kind):
+        uiId, vehId = self._ship_ids(ship)
+        pid = self._pid_for(vehId)
+        self._emit('')
+        self._emit('============== ENEMY DUMP [{}] tick={} =============='.format(kind, self._huntTicks))
+        self._emit('ids: uiId={} vehId={} playerId={}'.format(uiId, vehId, pid))
+        self._emit('-- dir(ship) values --')
+        for line in _describe(ship, '    '):
+            self._emit(line)
+        self._emit('    getPosition() = {}'.format(_safe_call(lambda: ship.getPosition())))
+        gd = self._ship_game_data(ship, pid)
+        self._emit('-- shipGameData type={} repr={} --'.format(type(gd).__name__, _safe_call(lambda: gd)))
+        for key in ('isVisible', 'isShipVisible', 'health', 'maxHealth', 'yaw', 'speed',
+                    'position', 'worldPosition', 'x', 'y', 'z', 'coords', 'point'):
+            self._emit('    gd[{}] = {}'.format(key, _s(self._gd_get(gd, key))))
+        if gd is not None and hasattr(gd, 'keys'):
+            self._emit('    gd.keys() = {}'.format(_safe_call(lambda: list(gd.keys()))))
+        elif gd is not None:
+            for line in _describe(gd, '    gd.'):
+                self._emit(line)
+        if pid is not None:
+            for label, fn in (('getPlayerInfo', lambda: battle.getPlayerInfo(pid)),
+                              ('getPlayerShipInfo', lambda: battle.getPlayerShipInfo(pid))):
+                self._emit('-- battle.{}({}) = {} --'.format(label, pid, _safe_call(fn)))
+                obj = _try(fn)
+                if obj is not None and not isinstance(obj, (int, long, float, bool, str, unicode)):
+                    for line in _describe(obj, '    '):
+                        self._emit(line)
+        self._dump_position_components(pid, uiId)
+        self._scan_collections_for(uiId, vehId, pid)
+
+    def _hunt(self, *args):
+        if self._captured:
+            return
+        now = _try(lambda: utils.getTimeFromGameStart(), 0.0) or 0.0
+        if (now - self._lastHunt) < 0.2:      # throttle: perTick fires every frame
+            return
+        self._lastHunt = now
+        self._huntTicks += 1
+        ships = _try(lambda: battle.getAllShips(), []) or []
+        best = None
+        bestKind = None
+        for ship in ships:
+            team = _get(ship, 'teamId')
+            if self._selfTeam is not None and team == self._selfTeam:
+                continue                       # skip self/allies
+            if _try(lambda s=ship: s.isAlive()) is False:
+                continue
+            uiId, vehId = self._ship_ids(ship)
+            pid = self._pid_for(vehId)
+            pos = self._get_pos(ship)
+            compPos = self._entity_comp_pos(pid, uiId, 'worldPosition')
+            if compPos is None:
+                compPos = self._entity_comp_pos(pid, uiId, 'mapPosition')
+            # JACKPOT: no getPosition() (the symptom: spotted-but-not-rendered)
+            # yet the entity position component DOES expose coords -> this proves
+            # the extractor fix reads a valid source. Capture and stop.
+            if pos is None and compPos is not None:
+                best, bestKind = ship, 'COMPONENT-POS-NO-GETPOS'
+                break
+            if pos is None:
+                if bestKind is None:
+                    best, bestKind = ship, 'ALIVE-NO-POSITION'
+                continue                       # keep hunting for the jackpot
+            if best is None:
+                gd = self._ship_game_data(ship, pid)
+                vis, _shipVis = self._visibility(ship, gd)
+                best, bestKind = ship, ('SPOTTED-AND-RENDERED' if vis else 'RENDERED')
+        if best is not None and bestKind not in self._dumpedKinds:
+            self._dumpedKinds.add(bestKind)
+            self._deep_dump_enemy(best, bestKind)
+            if bestKind == 'COMPONENT-POS-NO-GETPOS':
+                self._captured = True          # proven -- stop; otherwise keep hunting
+                self._stop_hunt()
+            self._flush()
+        if (self._huntTicks % 25) == 1:
+            self._emit('[hunt] tick={} captured={} kinds={}'
+                       .format(self._huntTicks, self._captured, sorted(self._dumpedKinds)))
+            self._flush()
+
+    def _start_hunt(self):
+        self._stop_hunt()
+        self._captured = False
+        self._dumpedKinds = set()
+        self._huntTicks = 0
+        self._lastHunt = 0.0
+        self._selfTeam = _try(lambda: battle.getSelfPlayerInfo().teamId)
+        self._huntHandle = _try(lambda: callbacks.perTick(self._hunt))
+        self._emit('[hunt] started (selfTeam={}, handle={})'.format(self._selfTeam, self._huntHandle))
+        self._flush()
+
+    def _stop_hunt(self):
+        if self._huntHandle is not None:
+            _try(lambda: callbacks.cancel(self._huntHandle))
+            self._huntHandle = None
 
     # -- entry points -------------------------------------------------------
     def _on_start(self, *args):
@@ -292,6 +640,15 @@ class Probe(object):
                 step()
             except Exception, e:
                 self._emit('[probe] step {} failed: {}'.format(step.__name__, _s(e)))
+        self._flush()
+        # Start polling for a spotted-but-not-rendered enemy (the key unknown).
+        self._start_hunt()
+
+    def _on_quit(self, *args):
+        self._stop_hunt()
+        self._emit('############### WowsProbe battle quit ###############')
+        self._emit('[hunt] final: captured={} kinds={} ticks={}'
+                   .format(self._captured, sorted(self._dumpedKinds), self._huntTicks))
         self._flush()
 
 
