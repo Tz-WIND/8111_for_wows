@@ -134,7 +134,9 @@ function draw() {
   const selfId = snap.self && snap.self.playerId;
 
   for (const o of objects) {
-    if (o.alive === false) continue;
+    // alive may be false or 0; zero HP wrecks must not become 灭点 ghosts
+    if (o.alive === false || o.alive === 0) continue;
+    if (typeof o.health === "number" && o.health <= 0) continue;
     const r = (o.type === "Battleship") ? 6 : (o.type === "Destroyer") ? 4 : 5;
     const col = colorFor(o, selfId);
     const live = (o.visible !== false) && (typeof o.nx === "number" || typeof o.x === "number");
@@ -144,6 +146,7 @@ function draw() {
       const stale = (typeof o.staleSeconds === "number") ? o.staleSeconds : 0;
       const hasLast = (typeof o.lastNx === "number") || (typeof o.lastX === "number");
       if (!hasLast || stale > GHOST_MAX) continue;
+      if (typeof o.lastHealth === "number" && o.lastHealth <= 0) continue;
       const p = projectLast(o);
       if (!p) continue;
       const [x, y] = p;
@@ -207,11 +210,14 @@ function render() {
   if (snap) {
     $("mapName").textContent = (snap.map && snap.map.name) || "(unknown)";
     $("battleType").textContent = snap.battleType || "-";
-    const alive = (snap.objects || []).filter(o => o.alive !== false);
+    const alive = (snap.objects || []).filter(o =>
+      o.alive !== false && o.alive !== 0 &&
+      !(typeof o.health === "number" && o.health <= 0));
     const liveN = alive.filter(o =>
       o.visible !== false && (typeof o.nx === "number" || typeof o.x === "number")).length;
     const ghostN = alive.filter(o =>
       o.visible === false && ((typeof o.lastNx === "number") || (typeof o.lastX === "number")) &&
+      !(typeof o.lastHealth === "number" && o.lastHealth <= 0) &&
       (typeof o.staleSeconds !== "number" || o.staleSeconds <= GHOST_MAX)).length;
     $("shipCount").textContent = liveN;
     $("ghostCount").textContent = ghostN;

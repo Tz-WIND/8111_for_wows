@@ -651,6 +651,30 @@ def _finite_ratio(numerator, denominator):
     return ratio if _finite_number(ratio) else None
 
 
+def _nonneg_number(value):
+    """True when value is a real number (not bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def is_ship_dead(ship):
+    """Dead ships must not keep last-seen ghost markers on the overlay.
+
+    `alive` may arrive as False or 0 depending on the collector/build, and a
+    ship that despawned after the killing blow may only show health/lastHealth
+    at zero.
+    """
+    if not isinstance(ship, dict):
+        return False
+    alive = ship.get("alive")
+    if alive is False or alive == 0:
+        return True
+    for key in ("health", "lastHealth"):
+        value = ship.get(key)
+        if _nonneg_number(value) and value <= 0:
+            return True
+    return False
+
+
 def build_map_objects(meta, state, bounds=None):
     if bounds is None:
         bounds = extract_bounds(meta)
@@ -665,10 +689,13 @@ def build_map_objects(meta, state, bounds=None):
         pid = s.get("playerId")
         meta_r = roster.get(pid, {})
         pos = s.get("position")
-        norm = normalize(pos, bounds)
+        # Prefer collector minimap nx/ny when present. World positions for
+        # spotted-only ships may come from an unstable map->world fit and can
+        # jump when that fit flips axes; mapPosition itself stays correct.
+        norm = normalize_direct(s.get("nx", s.get("mapX")),
+                                s.get("ny", s.get("mapY")))
         if norm is None:
-            norm = normalize_direct(s.get("nx", s.get("mapX")),
-                                    s.get("ny", s.get("mapY")))
+            norm = normalize(pos, bounds)
         mh = s.get("maxHealth") or meta_r.get("maxHealth")
         hp = s.get("health")
         team = s.get("teamId")
@@ -677,6 +704,7 @@ def build_map_objects(meta, state, bounds=None):
         rel = s.get("relation")
         if rel not in (0, 1, 2):
             rel = meta_r.get("relation")
+        dead = is_ship_dead(s)
         obj = {
             "uiId": s.get("uiId"),
             "vehicleId": s.get("vehicleId"),
@@ -687,8 +715,8 @@ def build_map_objects(meta, state, bounds=None):
             "name": s.get("name") or meta_r.get("shipName"),
             "playerName": meta_r.get("name"),
             "tier": meta_r.get("shipTier"),
-            "alive": s.get("alive"),
-            "visible": s.get("visible", pos is not None or norm is not None),
+            "alive": False if dead else s.get("alive"),
+            "visible": False if dead else s.get("visible", pos is not None or norm is not None),
             "x": pos[0] if pos else None,
             "z": pos[2] if pos else None,
             "yaw": s.get("yaw"),
@@ -696,30 +724,28 @@ def build_map_objects(meta, state, bounds=None):
             "maxHealth": mh,
             "hpRatio": _finite_ratio(hp, mh),
         }
-        if norm:
+        if not dead and norm:
             obj["nx"], obj["ny"] = norm[0], norm[1]
 
-        # last-known ("ghost") position for ships that lit up then went dark
-        last_pos = s.get("lastPosition")
-        if last_pos:
-            obj["lastX"], obj["lastZ"] = last_pos[0], last_pos[2]
-            lnorm = normalize(last_pos, bounds)
-            if lnorm is None:
-                lnorm = normalize_direct(s.get("lastNx", s.get("lastMapX")),
-                                         s.get("lastNy", s.get("lastMapY")))
-            if lnorm:
-                obj["lastNx"], obj["lastNy"] = lnorm[0], lnorm[1]
-            if s.get("lastYaw") is not None:
-                obj["lastYaw"] = s.get("lastYaw")
-            if s.get("lastHealth") is not None:
-                obj["lastHealth"] = s.get("lastHealth")
-            obj["lastSeenTs"] = s.get("lastSeenTs")
-            obj["staleSeconds"] = s.get("staleSeconds")
-        elif s.get("lastNx") is not None or s.get("lastMapX") is not None:
+        # last-known ("ghost") position for ships that lit up then went dark.
+        # Dead ships must not keep these markers -- overlay treats them as 灭点.
+        if not dead:
+            last_pos = s.get("lastPosition")
+            if last_pos:
+                obj["lastX"], obj["lastZ"] = last_pos[0], last_pos[2]
             lnorm = normalize_direct(s.get("lastNx", s.get("lastMapX")),
                                      s.get("lastNy", s.get("lastMapY")))
+            if lnorm is None and last_pos:
+                lnorm = normalize(last_pos, bounds)
             if lnorm:
                 obj["lastNx"], obj["lastNy"] = lnorm[0], lnorm[1]
+                if s.get("lastYaw") is not None:
+                    obj["lastYaw"] = s.get("lastYaw")
+                if s.get("lastHealth") is not None:
+                    obj["lastHealth"] = s.get("lastHealth")
+                obj["lastSeenTs"] = s.get("lastSeenTs")
+                obj["staleSeconds"] = s.get("staleSeconds")
+            elif last_pos is not None:
                 if s.get("lastYaw") is not None:
                     obj["lastYaw"] = s.get("lastYaw")
                 if s.get("lastHealth") is not None:

@@ -732,6 +732,9 @@ class Collector(object):
         # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
         # have seen, so enemies that lit up then went dark keep a "ghost" marker.
         self._lastSeen = {}
+        # Ships observed dead this battle. Prevents a sunk enemy that drops out of
+        # getAllShips() from being resurrected as a last-seen ("灭点") ghost.
+        self._deadKeys = set()
         # cached map->world affine (per battle/map); derived at runtime from ships
         # that expose BOTH getPosition() (world) and the mapPosition component.
         self._mapTransform = None
@@ -785,6 +788,7 @@ class Collector(object):
         self._resolve_paths()
         self._damage.clear()
         self._lastSeen = {}
+        self._deadKeys = set()
         self._mapTransform = None
         self._lastMetaWrite = 0.0
         self._metaRetryUntil = 0.0
@@ -830,6 +834,7 @@ class Collector(object):
         self._stop_tick()
         self._ballistics.stop()
         self._lastSeen = {}
+        self._deadKeys = set()
         self._mapTransform = None
         # write one final snapshot marking the battle inactive (through the same
         # single writer, so it can't race a still-queued "active" frame)
@@ -1140,11 +1145,52 @@ class Collector(object):
     def _ship_key(self, entry):
         """Stable per-battle key for last-seen tracking (prefixed to avoid
         collisions between different id namespaces)."""
+        keys = self._ship_keys(entry)
+        return keys[0] if keys else None
+
+    def _ship_keys(self, entry):
+        """All id aliases for a ship row / identity dict."""
+        keys = []
+        if not entry:
+            return keys
         for k in ('vehicleId', 'uiId', 'playerId'):
             v = entry.get(k)
             if v is not None:
-                return k[0] + str(v)
-        return None
+                keys.append(k[0] + str(v))
+        return keys
+
+    def _entry_is_dead(self, entry):
+        """True when the ship should never keep a last-seen ghost.
+
+        Use == so integer 0 from some client builds counts as dead; `is False`
+        would miss that and remember the wreck as a 灭点.
+        """
+        if not entry:
+            return False
+        alive = entry.get('alive')
+        if alive == False or alive == 0:
+            return True
+        health = entry.get('health')
+        try:
+            if health is not None and float(health) <= 0:
+                return True
+        except:
+            pass
+        return False
+
+    def _forget_ship(self, entry):
+        """Drop last-seen memory for every id alias of this ship and mark dead."""
+        keys = set(self._ship_keys(entry))
+        for key in list(self._lastSeen.keys()):
+            ident = self._lastSeen[key].get('identity') or {}
+            ident_keys = self._ship_keys(ident)
+            if key in keys or keys.intersection(ident_keys):
+                keys.update(ident_keys)
+                keys.add(key)
+        for key in keys:
+            self._deadKeys.add(key)
+            if key in self._lastSeen:
+                del self._lastSeen[key]
 
     def _remember(self, key, entry, pos, now):
         self._lastSeen[key] = {
@@ -1306,8 +1352,12 @@ class Collector(object):
 
         Returns ('A'|'B', ax, bx, az, bz) where 'A' means worldX<-mapX, worldZ<-mapY
         and 'B' means the axes are swapped. We try both and keep the better fit, so
-        we don't have to assume the minimap's axis orientation up front."""
-        if len(samples) < 2:
+        we don't have to assume the minimap's axis orientation up front.
+
+        Needs >=3 samples: with only 2 points both orientations fit exactly, so a
+        later frame that drops one axis (ships aligned) can flip A<->B and make
+        map-only enemies jump on the overlay."""
+        if len(samples) < 3:
             return None
         mxs = [s[0] for s in samples]
         mys = [s[1] for s in samples]
@@ -1358,9 +1408,13 @@ class Collector(object):
                 mp = mapIndex.get(pid)
                 if mp is not None:
                     calib.append((mp[0], mp[1], worldPos[0], worldPos[2]))
-        t = self._fit_map_transform(calib)
-        if t is not None:
-            self._mapTransform = t   # cache; map->world is constant per battle
+        # Lock the first good fit for the whole battle. Re-fitting every frame
+        # can flip A<->B when calibration ships line up on one axis, which makes
+        # spotted-only enemies (mapPosition -> world) jump to the wrong place.
+        if self._mapTransform is None:
+            t = self._fit_map_transform(calib)
+            if t is not None:
+                self._mapTransform = t
 
         # -- pass 2: build per-ship entries --------------------------------------
         out = []
@@ -1428,37 +1482,68 @@ class Collector(object):
                 if pos or norm is not None:
                     nAllyVis += 1
 
-            key = self._ship_key(entry)
-            if key is not None:
+            keys = self._ship_keys(entry)
+            for key in keys:
                 seen_keys.add(key)
-            alive = entry.get('alive')
-            if alive is False:
+            key = keys[0] if keys else None
+            if self._entry_is_dead(entry):
                 # sunk ship: drop any ghost memory, no last-seen marker
-                if key is not None and key in self._lastSeen:
-                    del self._lastSeen[key]
+                entry['alive'] = False
+                self._forget_ship(entry)
+            elif any(k in self._deadKeys for k in keys):
+                # previously observed dead under another alias; never revive
+                entry['alive'] = False
+                self._forget_ship(entry)
             elif pos or norm is not None:
                 if key is not None:
                     self._remember(key, entry, pos, now)
             elif key is not None:
                 # alive but no position this frame -> went dark; reuse last spot
                 seen = self._lastSeen.get(key)
+                if seen is None:
+                    for alt in keys[1:]:
+                        seen = self._lastSeen.get(alt)
+                        if seen is not None:
+                            break
                 if seen is not None:
-                    if (now - seen['ts']) <= self._lastSeenTtl:
+                    health = seen.get('health')
+                    try:
+                        dead_hp = health is not None and float(health) <= 0
+                    except:
+                        dead_hp = False
+                    if dead_hp:
+                        entry['alive'] = False
+                        self._forget_ship(entry)
+                    elif (now - seen['ts']) <= self._lastSeenTtl:
                         self._apply_ghost(entry, seen, now)
                     else:
-                        del self._lastSeen[key]
+                        self._forget_ship(seen.get('identity') or entry)
             out.append(entry)
 
         # ships no longer returned by getAllShips() at all: emit ghost-only rows
         nGhost = 0
         for key in list(self._lastSeen.keys()):
-            if key in seen_keys:
+            if key in seen_keys or key in self._deadKeys:
+                if key in self._deadKeys and key in self._lastSeen:
+                    del self._lastSeen[key]
                 continue
             seen = self._lastSeen[key]
+            ident = seen.get('identity') or {}
+            if any(k in self._deadKeys for k in self._ship_keys(ident)):
+                self._forget_ship(ident)
+                continue
+            health = seen.get('health')
+            try:
+                dead_hp = health is not None and float(health) <= 0
+            except:
+                dead_hp = False
+            if dead_hp:
+                self._forget_ship(ident)
+                continue
             if (now - seen['ts']) > self._lastSeenTtl:
                 del self._lastSeen[key]
                 continue
-            ghost = dict(seen['identity'])
+            ghost = dict(ident)
             ghost['alive'] = True
             ghost['visible'] = False
             self._apply_ghost(ghost, seen, now)
