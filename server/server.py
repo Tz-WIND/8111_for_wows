@@ -42,6 +42,47 @@ from aiohttp import web
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATIC = os.path.join(HERE, "static")
 
+# --- v1 envelope ---------------------------------------------------------
+# Every snapshot carries service identity, a monotonic cursor and per-domain
+# availability on top of the original flat "schema: 1" body. Consumers written
+# against the older flat shape keep working: nothing was renamed or removed.
+SERVICE_ID = "8111-for-wows"
+API_VERSION = "1.0"
+
+STATUS_WAITING = "waiting"
+STATUS_LIVE = "live"
+STATUS_STALE = "stale"
+STATUS_ENDED = "ended"
+
+AVAIL_AVAILABLE = "available"
+AVAIL_UNKNOWN = "unknown"
+AVAIL_STALE = "stale"
+AVAIL_UNSUPPORTED = "unsupported"
+
+# Domains this service can produce. Ones that need game APIs the collector mod
+# does not expose yet are declared unsupported instead of silently missing, so a
+# consumer can tell "no data this frame" apart from "never available here".
+SUPPORTED_DOMAINS = ("self", "objects", "roster", "damage", "ballistics", "map")
+UNSUPPORTED_DOMAINS = ("kills", "capturePoints", "torpedoes", "consumables")
+
+# Domains derived from the per-battle meta file; they do not go stale mid-battle
+# the way the ~10 Hz state file does.
+META_DOMAINS = ("roster", "map")
+
+STALE_MIN_SECONDS = 2.0
+STALE_POLL_FACTOR = 5.0
+
+EMPTY_DAMAGE = {"inflicted": {}, "received": {}, "teamTotal": {}}
+
+
+def stale_after(poll_interval):
+    """How long live data may go unchanged before the frame counts as stale."""
+    try:
+        interval = float(poll_interval or 0.0)
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(STALE_MIN_SECONDS, STALE_POLL_FACTOR * interval)
+
 # Sibling module: the generated map-recognition table (tools/gen_maps.py).
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -225,21 +266,25 @@ def domain_availability(meta, state, status):
     mt = meta or {}
     ballistics = st.get("ballistics")
 
-    def av(present):
-        if status == "stale":
+    def av(present, live_derived=True):
+        if status == "stale" and live_derived:
             return "stale"
         return "available" if present else "unknown"
 
     return {
         "self": av("self" in st and isinstance(st["self"], dict)),
         "objects": av("ships" in st and isinstance(st["ships"], list)),
-        "roster": av("roster" in mt and isinstance(mt["roster"], list)),
+        "roster": av(
+            "roster" in mt and isinstance(mt["roster"], list),
+            live_derived=False),
         "damage": av("damage" in st and isinstance(st["damage"], dict)),
         "ballistics": av(
             isinstance(ballistics, dict)
             and type(ballistics.get("available")) is bool
             and ballistics["available"]),
-        "map": av("map" in mt and isinstance(mt["map"], dict)),
+        "map": av(
+            "map" in mt and isinstance(mt["map"], dict),
+            live_derived=False),
     }
 
 
@@ -288,7 +333,8 @@ class Store:
     exactly one payload -- byte-identical whether fetched via /all or /ws.
     """
 
-    def __init__(self, instance_id=None, source_kind="file"):
+    def __init__(self, instance_id=None, source_kind="file",
+                 poll_interval=0.1, mode=None):
         self.version = 0                 # legacy /healthz counter (kept as-is)
         self.seq = 0                     # content cursor (see class docstring)
         self.instance_id = instance_id or _gen_instance_id()
@@ -301,8 +347,11 @@ class Store:
         self.state_received = False
         self.status = "waiting"          # waiting | live | stale | ended
         self.source_kind = source_kind   # "file" | "demo"
+        self.poll_interval = poll_interval
+        self.mode = mode or ("demo" if "demo" in source_kind else "live")
         self.ws_clients = set()          # set[web.WebSocketResponse]
         self._battle_active = False       # was the last valid state an active battle?
+        self._battle_seen = False
         self._battle_counter = 0
         self._cache_seq = -1
         self._cache_obj = None
@@ -359,6 +408,7 @@ class Store:
         if mod_id is not None:
             self.battle_id = str(mod_id)
         if active:
+            self._battle_seen = True
             if not self._battle_active:
                 # A new battle began this frame.
                 if mod_id is None:
@@ -397,6 +447,76 @@ class Store:
         self._cache_json = js
         self._cache_seq = self.seq
         return copy.deepcopy(obj), js
+
+    @property
+    def source_status(self):
+        """Compatibility name for consumers of the earlier Store contract."""
+        return self.status
+
+    @property
+    def last_update(self):
+        """The source frame time, not the time of a derived status change."""
+        return (round(self.last_state_update, 3)
+                if self.last_state_update is not None else None)
+
+    @property
+    def last_active_update(self):
+        return self.last_state_update
+
+    def set(self, meta=None, state=None):
+        """Compatibility ingest path; production file ingestion uses apply()."""
+        now = time.time()
+        if state == {}:
+            if meta is not None and valid_meta_payload(meta):
+                self.meta = meta
+                self.last_meta_update = now
+            self.state = {}
+            self.status = "waiting"
+            self._touch(now)
+            return
+
+        battle_seen_before = self._battle_seen
+        if not self.apply(now, meta=meta, state=state):
+            return
+        # The earlier in-process API treated an initial inactive frame as
+        # waiting. The file bridge keeps the stricter v1 behavior in apply().
+        if state is not None and not state.get("active") and not battle_seen_before:
+            self.status = "waiting"
+            self._cache_seq = -1
+
+    def derive_status(self, now=None):
+        """waiting -> live -> stale -> ended, from data age only.
+
+        A torn file, a parse failure or a dead collector must never look like a
+        finished battle, so `ended` requires the collector to actually say the
+        battle is no longer active.
+        """
+        now = time.time() if now is None else now
+        state = self.state or {}
+        if not state:
+            return STATUS_WAITING
+        if state.get("active"):
+            last = self.last_state_update if self.last_state_update is not None else now
+            if (now - last) > stale_after(self.poll_interval):
+                return STATUS_STALE
+            return STATUS_LIVE
+        return STATUS_ENDED if self._battle_seen else STATUS_WAITING
+
+    def refresh_status(self, now=None):
+        """Re-evaluate staleness. Returns True when the status (and cursor) moved.
+
+        This advances `seq` without touching `last_update`: the frame content is
+        genuinely different (a new status), but the underlying data really is
+        that old, so `/healthz.ageSeconds` must keep climbing.
+        """
+        status = self.derive_status(now)
+        if status == self.status:
+            return False
+        self.status = status
+        self.version += 1
+        self.seq += 1
+        self._cache_seq = -1
+        return True
 
 
 # ===========================================================================
@@ -611,7 +731,34 @@ def build_map_objects(meta, state, bounds=None):
     return objects, bounds
 
 
+def normalize_damage(damage):
+    """Always three tables, so a consumer never has to branch on missing keys."""
+    out = dict(EMPTY_DAMAGE)
+    if isinstance(damage, dict):
+        for key in EMPTY_DAMAGE:
+            value = damage.get(key)
+            out[key] = value if isinstance(value, dict) else {}
+        for key, value in damage.items():
+            if key not in out:
+                out[key] = value
+    return out
+
+
+def normalize_ballistics(ballistics):
+    if not isinstance(ballistics, dict) or not ballistics:
+        return {"available": False}
+    out = dict(ballistics)
+    out["available"] = bool(out.get("available"))
+    return out
+
+
 def build_all(meta, state):
+    """The original flat snapshot body (`schema: 1`), with empty values pinned.
+
+    Absent data has one fixed shape per domain -- `self` is null, lists are
+    empty, damage is three empty tables, ballistics is `{"available": false}` --
+    so consumers can diff frames without treating "missing" as a value change.
+    """
     info = resolve_map_info(meta)
     objects, bounds = build_map_objects(meta, state, info["bounds"])
     map_out = merge_map_out(meta, info)
@@ -625,11 +772,11 @@ def build_all(meta, state):
         "map": map_out,
         "bounds": list(bounds) if bounds else None,
         "boundsSource": info["boundsSource"],
-        "self": (state or {}).get("self"),
+        "self": (state or {}).get("self") or None,
         "objects": objects,
-        "roster": (meta or {}).get("roster", []),
-        "damage": (state or {}).get("damage", {}),
-        "ballistics": (state or {}).get("ballistics", {}),
+        "roster": (meta or {}).get("roster") or [],
+        "damage": normalize_damage((state or {}).get("damage")),
+        "ballistics": normalize_ballistics((state or {}).get("ballistics")),
         "diag": (state or {}).get("diag"),
     }
 
@@ -650,6 +797,16 @@ def _normalized_ballistics(value):
     return ballistics
 
 
+def build_capabilities(extensions=None):
+    """Return supported schema versions plus explicit unsupported domains."""
+    capabilities = dict(CAPABILITIES)
+    for name in UNSUPPORTED_DOMAINS:
+        capabilities.setdefault(name, None)
+    for name, value in (extensions or {}).items():
+        capabilities[name] = value["schema"]
+    return capabilities
+
+
 def build_snapshot(store):
     """The full served payload: legacy /all body + the additive envelope.
 
@@ -668,10 +825,11 @@ def build_snapshot(store):
     body["ballistics"] = _normalized_ballistics(st.get("ballistics"))
 
     extensions = _collect_extensions(store.meta, st)
-    capabilities = dict(CAPABILITIES)
+    capabilities = build_capabilities(extensions)
     availability = domain_availability(store.meta, st, store.status)
+    for name in UNSUPPORTED_DOMAINS:
+        availability.setdefault(name, AVAIL_UNSUPPORTED)
     for name, value in extensions.items():
-        capabilities[name] = value["schema"]
         if value.get("available") is True:
             availability[name] = (
                 "stale" if store.status == "stale" else "available")
@@ -686,7 +844,7 @@ def build_snapshot(store):
         "battleId": store.battle_id,
         "source": {
             "kind": store.source_kind,
-            "mode": body.get("battleType"),
+            "mode": store.mode,
             "status": store.status,
             "updatedAt": (round(store.last_state_update, 3)
                           if store.last_state_update is not None else None),
@@ -807,6 +965,7 @@ async def file_watcher(app, state_file, meta_file, interval):
             ]
             payloads = {}
             rejection = None
+            unreadable = []
 
             for source in candidates:
                 signature = before[source]
@@ -822,6 +981,11 @@ async def file_watcher(app, state_file, meta_file, interval):
                 if after_read != signature:
                     rejection = (source, "changed_during_read", signature)
                     break
+                if data is None:
+                    # A half-written JSON file must be retried, but it must not
+                    # block an independently valid update from the other file.
+                    unreadable.append((source, "invalid_payload", signature))
+                    continue
                 if not validators[source](data):
                     rejection = (source, "invalid_payload", signature)
                     break
@@ -847,7 +1011,7 @@ async def file_watcher(app, state_file, meta_file, interval):
                 retry_sources.update(candidates)
                 retry_sources.add(source)
                 health.reject(source, reason, signature)
-            elif candidates:
+            elif payloads:
                 now = time.time()
                 committed = store.apply(
                     now,
@@ -861,14 +1025,21 @@ async def file_watcher(app, state_file, meta_file, interval):
                         if "state" in payloads else None),
                 )
                 if committed:
-                    for source in candidates:
+                    for source in payloads:
                         acknowledged[source] = before[source]
-                    retry_sources.difference_update(candidates)
+                    retry_sources.difference_update(payloads)
                     changed = True
                 else:
                     retry_sources.update(candidates)
                     health.reject(candidates[0], "transaction_rejected",
                                   before[candidates[0]])
+                for source, reason, signature in unreadable:
+                    retry_sources.add(source)
+                    health.reject(source, reason, signature)
+            elif unreadable:
+                for source, reason, signature in unreadable:
+                    retry_sources.add(source)
+                    health.reject(source, reason, signature)
 
             now = time.time()
             # Run this in the same iteration as ingestion so an old active file
@@ -883,6 +1054,19 @@ async def file_watcher(app, state_file, meta_file, interval):
             health.record_error(error)
             raise
         await asyncio.sleep(interval)
+
+
+async def status_ticker(app, interval):
+    """Age live data into `stale` even while nothing new arrives on disk.
+
+    A collector that stops writing produces no file event, so without this the
+    last good frame would keep claiming to be live forever.
+    """
+    store = app["store"]
+    while True:
+        await asyncio.sleep(interval)
+        if store.refresh_status():
+            await broadcast(app)
 
 
 async def demo_generator(app, interval):

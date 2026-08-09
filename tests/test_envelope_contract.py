@@ -64,8 +64,11 @@ def test_legacy_flat_keys_preserved():
 def test_capabilities_and_availability_domains():
     obj, _ = make_store().snapshot()
     domains = {"self", "objects", "roster", "damage", "ballistics", "map"}
-    assert set(obj["capabilities"]) == domains
-    assert set(obj["availability"]) == domains
+    assert domains <= set(obj["capabilities"])
+    assert domains <= set(obj["availability"])
+    for name in S.UNSUPPORTED_DOMAINS:
+        assert obj["capabilities"][name] is None
+        assert obj["availability"][name] == "unsupported"
     # nothing present yet -> unknown, not a falsy "false"
     assert obj["availability"]["self"] == "unknown"
 

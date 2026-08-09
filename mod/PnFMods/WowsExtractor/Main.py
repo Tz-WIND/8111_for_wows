@@ -99,6 +99,9 @@ LAST_SEEN_TTL = 60.0          # default: keep reporting a dark ship's last-known
 META_RETRY_INTERVAL = 0.5     # battleInfo/map can be late in very small battles
 META_RETRY_SECONDS = 12.0
 SCHEMA_VERSION = 1
+# Version of the JSON contract written to disk. Distinct from API_VERSION above,
+# which declares the ModsAPI level to the PnFMods loader.
+WIRE_API_VERSION = '1.0'
 INVALID = -1
 
 
@@ -831,8 +834,9 @@ class Collector(object):
         # write one final snapshot marking the battle inactive (through the same
         # single writer, so it can't race a still-queued "active" frame)
         try:
-            snap = {'schema': SCHEMA_VERSION, 'active': False, 'ts': _now(),
-                    'battleId': self._battleId, 'ships': [], 'self': None}
+            snap = {'schema': SCHEMA_VERSION, 'apiVersion': WIRE_API_VERSION,
+                    'battleId': self._battleId, 'active': False, 'ts': _now(),
+                    'ships': [], 'self': None}
             self._write_state(snap)
         except:
             pass
@@ -963,11 +967,12 @@ class Collector(object):
         gameMode = _coerce(_get(battleInfo, 'gameMode'))
         meta = {
             'schema': SCHEMA_VERSION,
+            'apiVersion': WIRE_API_VERSION,
+            'battleId': self._battleId,
             'mod': {'name': MOD_NAME, 'version': MOD_VERSION},
             'ts': _now(),
             'battleType': battleType or gameMode,
             'gameMode': gameMode,
-            'battleId': self._battleId,
             'selfPlayerId': self._selfPlayerId,
             'map': self._build_map_info(battleInfo),
             'roster': self._build_roster(),
@@ -1094,9 +1099,10 @@ class Collector(object):
         ships, diag = self._build_ships(now)
         return {
             'schema': SCHEMA_VERSION,
+            'apiVersion': WIRE_API_VERSION,
+            'battleId': self._battleId,
             'active': True,
             'ts': now,
-            'battleId': self._battleId,
             'self': self._build_self(),
             'ships': ships,
             'damage': self._damage.snapshot(),

@@ -203,7 +203,7 @@ HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket �
 | 端点 | 说明 |
 | --- | --- |
 | `GET /` | 首页，列出所有端点 |
-| `GET /healthz` | 服务状态：`battleActive`、最后更新 `ageSeconds`、`wsClients` 等 |
+| `GET /healthz` | 服务状态：身份三元组 `serviceId/apiVersion/instanceId`，以及 `battleActive`、最后更新 `ageSeconds`、`wsClients` 等 |
 | `GET /all` | **全量合并快照**（meta + state + 归一化对象列表）。WebSocket 推送的也是它 |
 | `GET /map_obj.json` | 所有可见对象数组（归一化 `nx/ny` + 世界 `x/z`、`relation`、`type`、`name`、`hpRatio`、`yaw`…） |
 | `GET /map_info.json` | 地图识别结果：`mapId`（内部空间名）、`mapName`（友好名）、世界边界 `bounds`、`boundsKnown`、`boundsSource`、`battleType` |
@@ -214,6 +214,43 @@ HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket �
 | `GET /ballistics` | 当前弹种穿深 / 跳弹角 / 引信 等 |
 | `GET /ws` | WebSocket：每次数据更新（约 10Hz）推送一份 `/all` |
 | `GET /overlay` | 演示小地图页面 |
+
+### `/all` 与 `/ws` 的 v1 信封
+
+除了原有的扁平字段（`schema: 1`、`active`、`self`、`objects`…，均**未改名也未删除**），每份快照还带一层信封，用来回答「这是谁、这是第几帧、这一帧哪些数据能信」：
+
+```jsonc
+{
+  "serviceId": "8111-for-wows",   // 服务身份，用来确认不是连错了别的 8111
+  "apiVersion": "1.0",            // 信封契约版本；缺失即为旧版扁平快照
+  "instanceId": "9f2c…",          // 本次服务进程的 ID，重启即变
+  "seq": 128,                     // 单调游标，仅在内容变化时自增
+  "battleId": "1a2c-3-537",       // 本局标识，终局帧仍然保留
+  "source": {
+    "kind": "mod-file-bridge",    // 或 "demo-generator"
+    "mode": "live",               // 或 "demo"
+    "status": "live",             // waiting | live | stale | ended
+    "updatedAt": 1785662530.36
+  },
+  "capabilities": {               // 本服务能提供哪些数据域
+    "self": { "supported": true, "version": "1.0" },
+    "torpedoes": { "supported": false, "version": null }
+  },
+  "availability": {               // 本帧各域实际状态
+    "self": "available",          // available | unknown | stale | unsupported
+    "torpedoes": "unsupported"
+  },
+  "extensions": {}                // {name: {schema, data}}，未知扩展原样透传
+}
+```
+
+约定：
+
+- **`(instanceId, seq)` 是唯一游标。** REST 读取不会推进游标，因此同一游标下 `/all` 与 `/ws` 的内容完全一致，可以安全去重与排序。
+- **`unknown` 不等于 `false`。** 某个域这一帧没有数据时是 `unknown`，消费方不得据此推断否定结论。
+- **空值形状固定**：`self` 为 `null`、数组为 `[]`、`damage` 恒为三张表、`ballistics` 为 `{"available": false}`。这样逐帧比较时「缺数据」不会被误当成「值变了」。
+- **坏 JSON、半写文件或采集器停写不会伪造结束。** 活动数据超过 `max(2 秒, 5 × poll_interval)` 只会转成 `stale`（并推进 `seq`）；只有采集器明确写出 `active: false` 才是 `ended`。
+- 未装或未升级采集器时 `battleId` 由服务端 best-effort 生成，仅保证「换局会变」。
 
 ### `/map_obj.json` 单个对象字段
 
@@ -271,6 +308,15 @@ curl http://127.0.0.1:8124/map_obj.json
 ```
 
 `sample_data/` 里的 `state.json` / `meta.json` 就是采集器输出格式的样例，可拿来对照 schema。
+
+### 契约测试
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+`tests/` 用 `aiohttp.test_utils` 起真实服务，覆盖固定空值、游标语义、REST/WS 同帧一致、状态机转换、半写文件、未知扩展透传，以及 overlay / `ws_client.py` 依赖的旧字段是否仍在。
 
 ---
 
