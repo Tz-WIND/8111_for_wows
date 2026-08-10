@@ -42,6 +42,18 @@ def test_damage_always_has_three_tables_and_keeps_extras():
     assert body["damage"]["spotting"] == {"1": 2}
 
 
+def test_served_snapshot_keeps_damage_extras():
+    """/all and /ws go through build_snapshot, not bare build_all."""
+    store = make_store()
+    store.set(state=active_state(
+        damage={"inflicted": {"1": 5}, "spotting": {"1": 2}}))
+    snapshot = srv.build_snapshot(store)
+    assert snapshot["damage"]["inflicted"] == {"1": 5}
+    assert snapshot["damage"]["spotting"] == {"1": 2}
+    assert snapshot["damage"]["received"] == {}
+    assert snapshot["damage"]["teamTotal"] == {}
+
+
 def test_non_dict_damage_table_is_replaced_not_passed_through():
     body = srv.build_all({}, {"damage": {"inflicted": "nonsense"}})
     assert body["damage"]["inflicted"] == {}

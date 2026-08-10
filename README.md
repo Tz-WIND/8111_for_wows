@@ -32,6 +32,8 @@
 ├─ mod/                                  # 游戏内采集器（拷进 res_mods）
 │  └─ PnFMods/WowsExtractor/
 │     ├─ Main.py
+│     ├─ battle_identity.py              # 局 ID / session nonce（与 Main.py 同目录，必须一起拷）
+│     ├─ emit_guard.py                   # 退局写盘守卫（防止晚到的 live 帧盖掉 ended）
 │     └─ config.example.ini              # 采集器配置模板（复制为 config.ini）
 ├─ tools/probe/                          # 探针 mod（一次性诊断，确认字段名）
 │  └─ PnFMods/WowsProbe/Main.py
@@ -40,10 +42,12 @@
 ├─ uv.lock                               # uv 锁定文件
 ├─ server/
 │  ├─ server.py                          # 本地 HTTP + WebSocket 服务（aiohttp）
+│  ├─ maps.py                            # 地图识别表（tools/gen_maps.py 生成）
 │  ├─ requirements.txt                   # pip 备用安装清单（推荐用 uv）
 │  ├─ static/overlay.html                # 演示用小地图 overlay
 │  ├─ examples/ws_client.py              # 示例消费端（WS + REST）
 │  └─ sample_data/                       # 离线测试用样例 state.json / meta.json
+├─ tests/                                # 契约 / 回归测试
 ├─ run_server.bat                        # 一键启动服务（设置都在 config.ini，见下方）
 └─ README.md
 ```
@@ -98,7 +102,7 @@ ModsAPI 的 Python mod 由 `PnFModsLoader.py` 加载。如果你的 `res_mods/` 
 
 ### 第 2 步：装采集器
 
-1. 把整个 `mod/PnFMods/WowsExtractor/`（含 `Main.py` 和 `config.example.ini`）复制到
+1. 把整个 `mod/PnFMods/WowsExtractor/`（含 `Main.py`、`battle_identity.py`、`emit_guard.py` 和 `config.example.ini`）复制到
    `World_of_Warships/bin/<最新build号>/res_mods/PnFMods/WowsExtractor/`
 2. 确保 `res_mods/` 下有 `PnFModsLoader.py`
 3. （可选）在同目录执行 `copy config.example.ini config.ini`，按需修改 `config.ini`（例如把采集频率 `state_interval` 调大一点更省帧）；缺 `config.ini` 就用内置默认（10Hz）
@@ -189,7 +193,7 @@ uv run --no-dev python server/server.py --state-file "D:\...\res_mods\PnFMods\Wo
 - `(instanceId, seq)` 是快照游标：服务进程重启会更换 `instanceId`；数据内容或 `source.status` 变化才推进 `seq`，重复读取不会推进。相同游标的 `/all` 与 `/ws` 字节一致。
 - `source.status` 只有 `waiting`（尚无有效 state）、`live`（战斗中且新鲜）、`stale`（战斗数据停止更新）和 `ended`（采集器明确给出 inactive）。断流不会伪造成 `ended`。
 - `source.updatedAt` 是最后一次有效 state 的 Unix 秒时间；文件模式使用 state 文件修改时间并钳制未来时钟。meta 更新和 stale 状态翻转不会改写它。
-- `availability` 只有 `available`、`unknown`、`stale`。字段存在且类型正确时，即使数组或对象为空也可为 `available`；ballistics 仅在其 `available` 字段严格为布尔 `true` 时可用。
+- `availability` 只有 `available`、`unknown`、`stale`、`unsupported`。字段存在且类型正确时，即使数组或对象为空也可为 `available`；ballistics 仅在其 `available` 字段严格为布尔 `true` 时可用；服务明确不提供的域为 `unsupported`。
 - 地图 `bounds` 顺序固定为 `[minX, maxX, minZ, maxZ]`。
 - 扩展 ID 必须使用带点号的命名空间（如 `vendor.feature`），并包含字符串 `schema` 与 `data`。服务会原样保留其它扩展元数据，将 schema 加入 `capabilities`，并用严格布尔 `available` 生成动态 availability。
 - 后台采集任务异常退出时 `/healthz` 返回 HTTP `503`，同时仍返回服务身份、游标和有界诊断。
@@ -221,20 +225,20 @@ HTTP JSON 端点默认只对本机常见 Origin 返回 CORS 许可；WebSocket �
 
 ```jsonc
 {
-  "serviceId": "8111-for-wows",   // 服务身份，用来确认不是连错了别的 8111
+  "serviceId": "8111_for_wows",   // 服务身份，用来确认不是连错了别的 8111
   "apiVersion": "1.0",            // 信封契约版本；缺失即为旧版扁平快照
   "instanceId": "9f2c…",          // 本次服务进程的 ID，重启即变
   "seq": 128,                     // 单调游标，仅在内容变化时自增
   "battleId": "1a2c-3-537",       // 本局标识，终局帧仍然保留
   "source": {
-    "kind": "mod-file-bridge",    // 或 "demo-generator"
+    "kind": "file",               // 或 "demo"
     "mode": "live",               // 或 "demo"
     "status": "live",             // waiting | live | stale | ended
     "updatedAt": 1785662530.36
   },
-  "capabilities": {               // 本服务能提供哪些数据域
-    "self": { "supported": true, "version": "1.0" },
-    "torpedoes": { "supported": false, "version": null }
+  "capabilities": {               // 域 -> schema 版本字符串；不支持则为 null
+    "self": "1.0",
+    "torpedoes": null
   },
   "availability": {               // 本帧各域实际状态
     "self": "available",          // available | unknown | stale | unsupported

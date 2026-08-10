@@ -51,6 +51,11 @@ try:
 except:
     from battle_identity import BattleIdentity, create_session_nonce
 
+try:
+    from .emit_guard import should_write_state
+except:
+    from emit_guard import should_write_state
+
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
 
@@ -862,6 +867,10 @@ class Collector(object):
         path = self._stateFile
         if not path:
             return
+        # Drop a late live frame that would overwrite the quit-written inactive
+        # snapshot (tick can finish building after `_on_battle_quit`).
+        if not should_write_state(self._active, snap):
+            return
         w = self._writer
         if w is not None:
             try:
@@ -873,6 +882,8 @@ class Collector(object):
 
     # -- per-frame (throttled) ---------------------------------------------
     def _tick(self, *args):
+        if not self._active:
+            return
         now = _now()
         self._refresh_meta(now)
         if (now - self._lastWrite) < self._stateInterval:
@@ -880,6 +891,10 @@ class Collector(object):
         self._lastWrite = now
         try:
             snap = self._build_state(now)
+            # Quit can land while we were building; never overwrite the terminal
+            # inactive frame with a stale live snapshot.
+            if not self._active:
+                return
             self._write_state(snap)
         except Exception, e:
             logError('tick failed: {}'.format(_str(e)))
@@ -1106,7 +1121,7 @@ class Collector(object):
             'schema': SCHEMA_VERSION,
             'apiVersion': WIRE_API_VERSION,
             'battleId': self._battleId,
-            'active': True,
+            'active': bool(self._active),
             'ts': now,
             'self': self._build_self(),
             'ships': ships,

@@ -42,12 +42,24 @@ from aiohttp import web
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATIC = os.path.join(HERE, "static")
 
-# --- v1 envelope ---------------------------------------------------------
+# Sibling module: the generated map-recognition table (tools/gen_maps.py).
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import maps  # noqa: E402
+
+
+# ===========================================================================
+# service envelope contract (additive; legacy flat keys stay untouched)
+# ===========================================================================
 # Every snapshot carries service identity, a monotonic cursor and per-domain
 # availability on top of the original flat "schema: 1" body. Consumers written
 # against the older flat shape keep working: nothing was renamed or removed.
-SERVICE_ID = "8111-for-wows"
+# apiVersion is "major.minor". Consumers reject an unknown major; a missing
+# apiVersion means a pre-envelope (legacy) producer.
+SERVICE_ID = "8111_for_wows"
 API_VERSION = "1.0"
+FILE_SCHEMA_VERSION = 1
+HEALTH_ERROR_MAX_CHARS = 240
 
 STATUS_WAITING = "waiting"
 STATUS_LIVE = "live"
@@ -72,33 +84,6 @@ META_DOMAINS = ("roster", "map")
 STALE_MIN_SECONDS = 2.0
 STALE_POLL_FACTOR = 5.0
 
-EMPTY_DAMAGE = {"inflicted": {}, "received": {}, "teamTotal": {}}
-
-
-def stale_after(poll_interval):
-    """How long live data may go unchanged before the frame counts as stale."""
-    try:
-        interval = float(poll_interval or 0.0)
-    except (TypeError, ValueError):
-        interval = 0.0
-    return max(STALE_MIN_SECONDS, STALE_POLL_FACTOR * interval)
-
-# Sibling module: the generated map-recognition table (tools/gen_maps.py).
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
-import maps  # noqa: E402
-
-
-# ===========================================================================
-# service envelope contract (additive; legacy flat keys stay untouched)
-# ===========================================================================
-# apiVersion is "major.minor". Consumers reject an unknown major; a missing
-# apiVersion means a pre-envelope (legacy) producer.
-SERVICE_ID = "8111_for_wows"
-API_VERSION = "1.0"
-FILE_SCHEMA_VERSION = 1
-HEALTH_ERROR_MAX_CHARS = 240
-
 # Data domains this service can serve, and the schema version of each. A client
 # uses this to decide which detectors it may arm; it is intentionally static.
 CAPABILITIES = {
@@ -114,6 +99,15 @@ CAPABILITIES = {
 # carries an explicit availability flag. Keeps a client from guessing shapes.
 EMPTY_DAMAGE = {"inflicted": {}, "received": {}, "teamTotal": {}}
 EMPTY_BALLISTICS = {"available": False}
+
+
+def stale_after(poll_interval):
+    """How long live data may go unchanged before the frame counts as stale."""
+    try:
+        interval = float(poll_interval or 0.0)
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(STALE_MIN_SECONDS, STALE_POLL_FACTOR * interval)
 
 
 def _gen_instance_id():
@@ -807,14 +801,6 @@ def build_all(meta, state):
     }
 
 
-def _normalized_damage(value):
-    damage = value if isinstance(value, dict) else {}
-    return {
-        key: table if isinstance(table := damage.get(key), dict) else {}
-        for key in ("inflicted", "received", "teamTotal")
-    }
-
-
 def _normalized_ballistics(value):
     ballistics = dict(value) if isinstance(value, dict) else {}
     available = ballistics.get("available")
@@ -847,7 +833,7 @@ def build_snapshot(store):
     # ballistics always states availability.
     body["objects"] = body.get("objects") or []
     body["roster"] = body.get("roster") or []
-    body["damage"] = _normalized_damage(st.get("damage"))
+    # build_all already pinned damage via normalize_damage (keeps extras).
     body["ballistics"] = _normalized_ballistics(st.get("ballistics"))
 
     extensions = _collect_extensions(store.meta, st)
@@ -1080,19 +1066,6 @@ async def file_watcher(app, state_file, meta_file, interval):
             health.record_error(error)
             raise
         await asyncio.sleep(interval)
-
-
-async def status_ticker(app, interval):
-    """Age live data into `stale` even while nothing new arrives on disk.
-
-    A collector that stops writing produces no file event, so without this the
-    last good frame would keep claiming to be live forever.
-    """
-    store = app["store"]
-    while True:
-        await asyncio.sleep(interval)
-        if store.refresh_status():
-            await broadcast(app)
 
 
 async def demo_generator(app, interval):
@@ -1407,7 +1380,8 @@ async def h_roster(request):
 
 
 async def h_damage(request):
-    return jr((request.app[STORE_KEY].state or {}).get("damage", {}))
+    return jr(normalize_damage(
+        (request.app[STORE_KEY].state or {}).get("damage")))
 
 
 async def h_ballistics(request):
@@ -1438,6 +1412,22 @@ async def h_debug(request):
     return jr({"diag": diag, "ships": per_ship})
 
 
+async def open_ws_subscription(store, ws):
+    """Send the hello frame, then join broadcasts without reverse-ordering seq.
+
+    Broadcast while the initial `send_str` is in flight must not deliver a newer
+    frame before the hello. Send first (outside `ws_clients`), join, then catch
+    up if the cursor moved during the hello send.
+    """
+    obj, payload = store.snapshot()
+    hello_seq = obj["seq"]
+    await ws.send_str(payload)
+    store.ws_clients.add(ws)
+    latest, latest_payload = store.snapshot()
+    if latest["seq"] != hello_seq:
+        await ws.send_str(latest_payload)
+
+
 async def h_ws(request):
     origin = request.headers.get("Origin")
     if origin and not origin_allowed(
@@ -1446,10 +1436,8 @@ async def h_ws(request):
     store = request.app[STORE_KEY]
     ws = web.WebSocketResponse(heartbeat=20.0)
     await ws.prepare(request)
-    store.ws_clients.add(ws)
     try:
-        _, payload = store.snapshot()
-        await ws.send_str(payload)
+        await open_ws_subscription(store, ws)
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.ERROR:
                 break

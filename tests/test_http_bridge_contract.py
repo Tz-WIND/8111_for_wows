@@ -205,9 +205,24 @@ def test_legacy_side_endpoints_keep_working(tmp_path):
             assert isinstance(await get_json(client, "/map_obj.json"), list)
             assert (await get_json(client, "/map_info"))["boundsKnown"] is True
             assert isinstance(await get_json(client, "/roster"), list)
-            assert "teamTotal" in await get_json(client, "/damage")
+            damage = await get_json(client, "/damage")
+            assert damage == {
+                "inflicted": {}, "received": {}, "teamTotal": {},
+            }
             assert "available" in await get_json(client, "/ballistics")
             assert (await get_json(client, "/indicators"))["health"] == 40000
+
+    run(scenario())
+
+
+def test_damage_endpoint_pins_empty_tables_when_state_omits_them(tmp_path):
+    async def scenario():
+        async with running_client(tmp_path) as (client, files):
+            files.write_state(active_state(damage={}))
+            await wait_until(lambda: is_active(client))
+            assert await get_json(client, "/damage") == {
+                "inflicted": {}, "received": {}, "teamTotal": {},
+            }
 
     run(scenario())
 
