@@ -46,6 +46,14 @@ try:
 except:
     _json_module = None
 
+try:
+    from .battle_identity import BattleIdentity, create_session_nonce
+except:
+    from battle_identity import BattleIdentity, create_session_nonce
+
+# One nonce per game/mod load prevents fallback IDs repeating after a restart.
+SESSION_NONCE = create_session_nonce()
+
 
 def _get_threading():
     """Best-effort handle to the `threading` module.
@@ -707,6 +715,8 @@ class Collector(object):
         self._lastWrite = 0.0
         self._active = False
         self._selfPlayerId = None
+        self._battleIdentity = BattleIdentity(SESSION_NONCE)
+        self._battleId = None
         self._selfTeam = _UNSET       # memoized once per snapshot build
         self._stateInterval = STATE_INTERVAL
         self._lastSeenTtl = LAST_SEEN_TTL
@@ -777,6 +787,29 @@ class Collector(object):
         self._metaRetryUntil = 0.0
         self._metaReady = False
         self._selfPlayerId = _try(lambda: battle.getSelfPlayerInfo().id)
+        self._battleId = self._battleIdentity.start(
+            self._selfPlayerId, self._find_arena_id())
+
+    def _find_arena_id(self):
+        """Return the raw arena id when the client has exposed it yet."""
+        for getter in (
+                lambda: battle.getArenaInfo(),
+                lambda: self._battle_info_component()):
+            info = _try(getter)
+            if info is None:
+                continue
+            for key in ('arenaUniqueId', 'arenaUniqueID', 'uniqueId',
+                        'uniqueID', 'arenaId', 'arenaID', 'battleId'):
+                val = _coerce(_get(info, key))
+                if val not in (None, '', 0):
+                    return val
+        return None
+
+    def _promote_battle_id(self):
+        """Promote a fallback id when the arena id arrives after battle start."""
+        before = self._battleId
+        self._battleId = self._battleIdentity.promote(self._find_arena_id())
+        return self._battleId != before
 
     def _on_battle_shown(self, *args):
         self._active = True
@@ -799,7 +832,7 @@ class Collector(object):
         # single writer, so it can't race a still-queued "active" frame)
         try:
             snap = {'schema': SCHEMA_VERSION, 'active': False, 'ts': _now(),
-                    'ships': [], 'self': None}
+                    'battleId': self._battleId, 'ships': [], 'self': None}
             self._write_state(snap)
         except:
             pass
@@ -901,13 +934,19 @@ class Collector(object):
         return bool(mode) and self._meta_has_precise_map(meta.get('map') or {})
 
     def _refresh_meta(self, now=None, force=False):
-        if self._metaReady and not force:
-            return
         if now is None:
             now = _now()
-        if (not force) and self._metaRetryUntil and now > self._metaRetryUntil:
+        within_retry = (not self._metaRetryUntil
+                        or now <= self._metaRetryUntil)
+        promoted = False
+        if force or (within_retry and not self._battleIdentity.is_arena):
+            promoted = self._promote_battle_id()
+        if self._metaReady and not force and not promoted:
             return
-        if (not force) and (now - self._lastMetaWrite) < META_RETRY_INTERVAL:
+        if (not force) and not within_retry and not promoted:
+            return
+        if (not force) and not promoted \
+                and (now - self._lastMetaWrite) < META_RETRY_INTERVAL:
             return
         meta = self._build_meta()
         _atomic_write(self._metaFile, json_dumps(meta))
@@ -928,6 +967,7 @@ class Collector(object):
             'ts': _now(),
             'battleType': battleType or gameMode,
             'gameMode': gameMode,
+            'battleId': self._battleId,
             'selfPlayerId': self._selfPlayerId,
             'map': self._build_map_info(battleInfo),
             'roster': self._build_roster(),
@@ -1056,6 +1096,7 @@ class Collector(object):
             'schema': SCHEMA_VERSION,
             'active': True,
             'ts': now,
+            'battleId': self._battleId,
             'self': self._build_self(),
             'ships': ships,
             'damage': self._damage.snapshot(),

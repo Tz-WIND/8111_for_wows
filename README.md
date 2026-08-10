@@ -61,14 +61,14 @@ copy config.example.ini config.ini
 服务端用 [`uv`](https://docs.astral.sh/uv/) 管理环境，依赖 `aiohttp`。在仓库根目录执行：
 
 ```bash
-uv sync                          # 首次：创建 .venv 并安装 aiohttp
-uv run python server/server.py --demo
+uv sync --no-dev                 # 首次：创建 .venv，仅安装运行依赖
+uv run --no-dev python server/server.py --demo
 ```
 
 浏览器打开 <http://127.0.0.1:8111/overlay> 就能看到 10 艘船在小地图上跑动（合成数据）。
 首页 <http://127.0.0.1:8111/> 列出全部端点。
 
-> 服务端基于 **aiohttp**（异步 HTTP + WebSocket），由 **uv** 管理依赖与虚拟环境；`uv sync` 会按 `pyproject.toml` / `uv.lock` 自动选择合适的 Python（已在 3.13 上测试）并安装 `aiohttp`。
+> 服务端基于 **aiohttp**（异步 HTTP + WebSocket），由 **uv** 管理依赖与虚拟环境；`uv sync --no-dev` 会按 `pyproject.toml` / `uv.lock` 自动选择合适的 Python（已在 3.13 上测试）并只安装运行依赖。
 > 没装 uv 时也可用 pip：`pip install -r server/requirements.txt` 后 `python server/server.py --demo`。
 
 ---
@@ -119,14 +119,14 @@ copy config.example.ini config.ini
 # 编辑 config.ini 里的 game_dir
 ```
 
-然后双击 `run_server.bat`（它会自动 `uv sync` 再启动）。或在仓库根目录手动：
+然后双击 `run_server.bat`（它会自动 `uv sync --no-dev` 再启动）。或在仓库根目录手动：
 
 ```bash
 # 默认读取 config.ini（game_dir / host / port / poll_interval）
-uv run python server/server.py
+uv run --no-dev python server/server.py
 # 命令行参数会覆盖 config.ini，例如临时换端口或指定文件：
-uv run python server/server.py --port 8125
-uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtractor\state.json"
+uv run --no-dev python server/server.py --port 8125
+uv run --no-dev python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtractor\state.json"
 ```
 
 打开 <http://127.0.0.1:8111/overlay> 即可看到实时小地图。
@@ -180,6 +180,19 @@ uv run python server/server.py --state-file "D:\...\res_mods\PnFMods\WowsExtract
 | `--allowed-origin` | 本机常见 Origin | 添加一个允许的浏览器 Origin，用于 HTTP CORS 与 WebSocket 握手；可重复传。传 `--allowed-origin "*"` 会恢复通配行为 |
 
 > 表中"默认"列指**既没传命令行、`config.ini` 里也没设**时的内置值。
+
+---
+
+## v1 数据契约
+
+- 服务身份固定为 `serviceId="8111_for_wows"`、`apiVersion="1.0"`。消费者应拒绝未知的服务 ID 或 API major；同一 major 内只做向后兼容的增量扩展。
+- `(instanceId, seq)` 是快照游标：服务进程重启会更换 `instanceId`；数据内容或 `source.status` 变化才推进 `seq`，重复读取不会推进。相同游标的 `/all` 与 `/ws` 字节一致。
+- `source.status` 只有 `waiting`（尚无有效 state）、`live`（战斗中且新鲜）、`stale`（战斗数据停止更新）和 `ended`（采集器明确给出 inactive）。断流不会伪造成 `ended`。
+- `source.updatedAt` 是最后一次有效 state 的 Unix 秒时间；文件模式使用 state 文件修改时间并钳制未来时钟。meta 更新和 stale 状态翻转不会改写它。
+- `availability` 只有 `available`、`unknown`、`stale`。字段存在且类型正确时，即使数组或对象为空也可为 `available`；ballistics 仅在其 `available` 字段严格为布尔 `true` 时可用。
+- 地图 `bounds` 顺序固定为 `[minX, maxX, minZ, maxZ]`。
+- 扩展 ID 必须使用带点号的命名空间（如 `vendor.feature`），并包含字符串 `schema` 与 `data`。服务会原样保留其它扩展元数据，将 schema 加入 `capabilities`，并用严格布尔 `available` 生成动态 availability。
+- 后台采集任务异常退出时 `/healthz` 返回 HTTP `503`，同时仍返回服务身份、游标和有界诊断。
 
 ---
 
@@ -243,8 +256,8 @@ ws.onmessage = (ev) => {
 命令行示例（客户端只用 Python 标准库，无需额外依赖）：
 
 ```bash
-uv run python server/examples/ws_client.py --port 8111 --messages 10   # 流式打印
-uv run python server/examples/ws_client.py --port 8111 --rest          # 单次 REST
+uv run --no-dev python server/examples/ws_client.py --port 8111 --messages 10   # 流式打印
+uv run --no-dev python server/examples/ws_client.py --port 8111 --rest          # 单次 REST
 ```
 
 ---
@@ -252,7 +265,7 @@ uv run python server/examples/ws_client.py --port 8111 --rest          # 单次 
 ## 离线自测（不开游戏）
 
 ```bash
-uv run python server/server.py --state-file server/sample_data/state.json --port 8124
+uv run --no-dev python server/server.py --state-file server/sample_data/state.json --port 8124
 curl http://127.0.0.1:8124/all
 curl http://127.0.0.1:8124/map_obj.json
 ```

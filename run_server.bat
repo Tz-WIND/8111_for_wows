@@ -25,10 +25,10 @@ if errorlevel 1 (
 )
 
 REM create .venv and install aiohttp if needed (fast no-op once synced)
-uv sync
+uv sync --no-dev
 
 REM no args -> read everything from config.ini; otherwise pass flags through
-uv run python server/server.py %*
+uv run --no-dev python server/server.py %*
 
 endlocal
 pause

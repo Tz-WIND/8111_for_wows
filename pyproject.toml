@@ -13,3 +13,13 @@ dependencies = [
 # library, so tell uv not to try to build/install it as a package.
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-aiohttp>=1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
