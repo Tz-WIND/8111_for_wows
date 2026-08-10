@@ -38,7 +38,8 @@ def meta_payload(**values):
 # --------------------------------------------------------------------------
 def test_empty_snapshot_fixed_values():
     obj, _ = make_store().snapshot()
-    assert obj["serviceId"] == S.SERVICE_ID
+    assert S.SERVICE_ID == "8111_for_wows"
+    assert obj["serviceId"] == "8111_for_wows"
     assert obj["apiVersion"] == S.API_VERSION
     assert obj["instanceId"] == "inst1"
     assert obj["seq"] == 0
