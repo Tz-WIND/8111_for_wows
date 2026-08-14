@@ -64,11 +64,13 @@ except:
 try:
     from .damage_tracker import (
         DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
-        extract_vehicle_id, dark_last_seen_entries)
+        extract_vehicle_id, dark_last_seen_entries, preferred_ghost_shot,
+        ghost_impact_position, consume_ghost_impact)
 except:
     from damage_tracker import (
         DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
-        extract_vehicle_id, dark_last_seen_entries)
+        extract_vehicle_id, dark_last_seen_entries, preferred_ghost_shot,
+        ghost_impact_position, consume_ghost_impact)
 
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
@@ -695,6 +697,7 @@ class Collector(object):
         # Ships observed dead this battle. Prevents a sunk enemy that drops out of
         # getAllShips() from being resurrected as a last-seen ("灭点") ghost.
         self._deadKeys = set()
+        self._lastShellImpact = None
         # cached map->world affine (per battle/map); derived at runtime from ships
         # that expose BOTH getPosition() (world) and the mapPosition component.
         self._mapTransform = None
@@ -751,6 +754,7 @@ class Collector(object):
         self._lastSeen = {}
         self._visibleShipKeys = set()
         self._deadKeys = set()
+        self._lastShellImpact = None
         self._mapTransform = None
         self._lastMetaWrite = 0.0
         self._metaRetryUntil = 0.0
@@ -801,6 +805,7 @@ class Collector(object):
         self._lastSeen = {}
         self._visibleShipKeys = set()
         self._deadKeys = set()
+        self._lastShellImpact = None
         self._mapTransform = None
         # write one final snapshot marking the battle inactive (through the same
         # single writer, so it can't race a still-queued "active" frame)
@@ -883,9 +888,14 @@ class Collector(object):
                 self._damage.remember(rec[0], rec[1], rec[2])
 
     def _on_damages(self, victimId, damages):
+        impact = consume_ghost_impact(
+            self._lastShellImpact, damages, now=_now())
+        # A damage packet gets one chance to consume the shell context. Keeping
+        # it beyond this callback can attach the next salvo to the wrong hull.
+        self._lastShellImpact = None
         fallback = None
         if extract_vehicle_id(victimId) is None:
-            fallback = self._ghost_victim_fallback()
+            fallback = self._ghost_victim_fallback(impact)
         _try(lambda: self._damage.on_damages(
             victimId, damages, fallback_victim=fallback))
 
@@ -897,9 +907,14 @@ class Collector(object):
         # simultaneous secondary packet for a different target.
         # When the victim is 灭点, victimId is often 0 -- match the impact
         # against last-seen ghosts so the salvo still counts.
+        impact = preferred_ghost_shot(
+            shotPosition, self._lastShellImpact,
+            shooter_id=shooterId, shot_id=shotId, now=_now())
+        self._lastShellImpact = impact
+        impact_position = ghost_impact_position(impact)
         fallback = None
         if extract_vehicle_id(victimId) is None:
-            fallback = self._ghost_victim_fallback(shotPosition)
+            fallback = self._ghost_victim_fallback(impact_position)
         _try(lambda: self._damage.on_shell(
             victimId, shooterId, damage, fallback_victim=fallback))
 
@@ -1560,7 +1575,7 @@ class Collector(object):
                     entry[k] = v
             # 3D ship.health is empty on some builds; fill from dataHub avatar
             # health (the component TTaroTeamPanel's side bars already use).
-            apply_ui_health(entry, ui_hp)
+            apply_ui_health(entry, ui_hp, for_unspotted=not entry.get('visible'))
             # spotted-only enemies have no ship.yaw; fall back to mapPosition yaw
             if entry.get('yaw') is None and mp is not None and mp[2] is not None:
                 entry['yaw'] = mp[2]
@@ -1648,7 +1663,13 @@ class Collector(object):
             ghost['alive'] = True
             ghost['visible'] = False
             self._apply_ghost(ghost, seen, now)
-            apply_ui_health(ghost, ui_hp)
+            apply_ui_health(ghost, ui_hp, for_unspotted=True)
+            if self._entry_is_dead(ghost):
+                # UI/team panel learned they sank while dark. Emit one dead
+                # row so consumers see True→False, then drop the 灭点 marker.
+                ghost['alive'] = False
+                ghost['visible'] = False
+                self._forget_ship(ghost)
             out.append(ghost)
             nGhost += 1
         self._visibleShipKeys = visible_keys

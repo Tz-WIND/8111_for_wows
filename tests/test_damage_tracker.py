@@ -357,6 +357,28 @@ def test_guess_ghost_victim_picks_nearest_enemy_last_seen():
     assert D.guess_ghost_victim(ghosts, [110.0, 0.0, 90.0]) == 77
 
 
+def test_guess_ghost_victim_only_accepts_explicit_enemies():
+    ghosts = [
+        {'identity': {'vehicleId': 11, 'relation': 0},
+         'pos': [0.0, 0.0, 0.0]},
+        {'identity': {'vehicleId': 12, 'relation': -1},
+         'pos': [1.0, 0.0, 0.0]},
+        {'identity': {'vehicleId': 77, 'relation': 2},
+         'pos': [2.0, 0.0, 0.0]},
+    ]
+
+    assert D.guess_ghost_victim(ghosts, [0.0, 0.0, 0.0]) == 77
+
+
+def test_guess_ghost_victim_rejects_impact_over_2500_metres_away():
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'relation': 2},
+         'pos': [100.0, 0.0, 0.0]},
+    ]
+
+    assert D.guess_ghost_victim(ghosts, [0.0, 0.0, 0.0]) is None
+
+
 def test_guess_ghost_victim_uses_the_only_enemy_ghost_without_shot_pos():
     ghosts = [
         {'identity': {'vehicleId': 77, 'playerId': 901, 'relation': 2},
@@ -447,7 +469,7 @@ def test_dark_filter_then_guess_does_not_pick_closer_spotted_enemy():
     shot = [110.0, 0.0, 90.0]
     assert D.guess_ghost_victim(list(last_seen.values()), shot) == 11
     dark = D.dark_last_seen_entries(last_seen, visible_keys=set(['v11']))
-    assert D.guess_ghost_victim(dark, shot) == 77
+    assert D.guess_ghost_victim(dark, shot) is None
 
 
 def test_guess_ghost_victim_treats_invalid_shot_position_as_missing():
@@ -458,3 +480,36 @@ def test_guess_ghost_victim_treats_invalid_shot_position_as_missing():
     ]
     assert D.guess_ghost_victim(ghosts, 1.57) is None
     assert D.guess_ghost_victim(ghosts, True) is None
+
+
+def test_preferred_ghost_shot_keeps_a_valid_shell_impact():
+    shot = [110.0, 0.0, 90.0]
+    impact = D.preferred_ghost_shot(
+        shot, shooter_id=1, shot_id=7, now=100.0)
+
+    assert D.ghost_impact_position(impact) == shot
+
+
+def test_preferred_ghost_shot_reuses_only_same_recent_shell():
+    last = D.preferred_ghost_shot(
+        [400.0, 0.0, 400.0], shooter_id=1, shot_id=7, now=100.0)
+
+    assert D.preferred_ghost_shot(
+        None, last, shooter_id=1, shot_id=7, now=100.5) == last
+    assert D.preferred_ghost_shot(
+        None, last, shooter_id=2, shot_id=7, now=100.5) is None
+    assert D.preferred_ghost_shot(
+        None, last, shooter_id=1, shot_id=8, now=100.5) is None
+    assert D.preferred_ghost_shot(
+        None, last, shooter_id=1, shot_id=7, now=101.1) is None
+
+
+def test_damage_packet_uses_only_recent_impact_from_same_shooter():
+    last = D.preferred_ghost_shot(
+        [400.0, 0.0, 400.0], shooter_id=1, shot_id=7, now=100.0)
+    matching = [{'vehicleID': 1, 'damage': 5000}]
+    other = [{'vehicleID': 2, 'damage': 5000}]
+
+    assert D.consume_ghost_impact(last, matching, now=100.5) == [400.0, 0.0, 400.0]
+    assert D.consume_ghost_impact(last, other, now=100.5) is None
+    assert D.consume_ghost_impact(last, matching, now=101.1) is None

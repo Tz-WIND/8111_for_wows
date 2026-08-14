@@ -29,7 +29,10 @@ victim from a last-seen ghost when we can.
 # ModsAPI sentinel: victim/shooter id when the ship is not currently
 # loaded (灭点, scenario structures, etc.). Not a real vehicle id.
 UNKNOWN_VICTIM = 0
-GHOST_MATCH_MAX_DIST = 2500.0
+BIGWORLD_METERS_PER_UNIT = 30.0
+GHOST_MATCH_MAX_DIST_METERS = 2500.0
+GHOST_MATCH_MAX_DIST = GHOST_MATCH_MAX_DIST_METERS / BIGWORLD_METERS_PER_UNIT
+GHOST_IMPACT_MAX_AGE = 1.0
 
 
 def _get_field(obj, *names):
@@ -222,10 +225,10 @@ def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
     """Pick a last-seen (灭点) enemy as the shell victim when ModsAPI omits the id.
 
     ``last_seen_entries`` is an iterable of collector last-seen records:
-    ``{identity: {vehicleId, relation, ...}, pos: [x,y,z]}``. Allies
-    (relation==1) are ignored. Duplicate rows for one vehicle (uiId then
+    ``{identity: {vehicleId, relation, ...}, pos: [x,y,z]}``. Only explicit
+    enemies (relation==2) are eligible. Duplicate rows for one vehicle (uiId then
     vehicleId) count as one ship. With a shot impact, the nearest enemy
-    within ``max_dist`` metres wins; without one, a single remaining
+    within ``max_dist`` BigWorld units wins; without one, a single remaining
     enemy ghost is used. Invalid shot positions are treated as missing.
     """
     if max_dist is None:
@@ -239,7 +242,7 @@ def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
             pos = seen.get('pos')
         if not isinstance(ident, dict):
             continue
-        if ident.get('relation') == 1:
+        if ident.get('relation') != 2:
             continue
         vid = extract_vehicle_id(ident.get('vehicleId'))
         if vid is None:
@@ -277,8 +280,72 @@ def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
             best = vid
     if best is not None:
         return best
-    if len(enemies) == 1:
-        return enemies[0][0]
+    return None
+
+
+def _impact_is_recent(impact, now, max_age=None):
+    if max_age is None:
+        max_age = GHOST_IMPACT_MAX_AGE
+    if not isinstance(impact, dict):
+        return False
+    try:
+        age = float(now) - float(impact.get('at'))
+    except Exception:
+        return False
+    return 0.0 <= age <= max_age
+
+
+def ghost_impact_position(impact):
+    """Return a cached impact position only when its shape is valid."""
+    if not isinstance(impact, dict):
+        return None
+    position = impact.get('position')
+    return position if _xz(position) is not None else None
+
+
+def preferred_ghost_shot(shot_position, last_impact=None, shooter_id=None,
+                         shot_id=None, now=None, max_age=None):
+    """Impact used to name a 灭点 victim.
+
+    Shell callbacks carry the hit point when ModsAPI argument order is
+    right. Reuse a missing hit point only for the same recent shooter and
+    shot; a naked position cache can otherwise leak across targets.
+    """
+    point = _xz(shot_position)
+    if point is not None:
+        return {
+            'position': [point[0], 0.0, point[1]],
+            'shooterId': extract_vehicle_id(shooter_id),
+            'shotId': _as_id(shot_id),
+            'at': now,
+        }
+    if not _impact_is_recent(last_impact, now, max_age):
+        return None
+    shooter = extract_vehicle_id(shooter_id)
+    shot = _as_id(shot_id)
+    if shooter is None or shot is None:
+        return None
+    if last_impact.get('shooterId') != shooter:
+        return None
+    if last_impact.get('shotId') != shot:
+        return None
+    return last_impact
+
+
+def consume_ghost_impact(last_impact, damages, now=None, max_age=None):
+    """Use one recent impact for a damage packet from the same shooter."""
+    if not _impact_is_recent(last_impact, now, max_age):
+        return None
+    shooter = last_impact.get('shooterId')
+    if shooter is None:
+        return None
+    try:
+        entries = damages or []
+    except Exception:
+        entries = []
+    for entry in entries:
+        if extract_attacker_vehicle_id(entry) == shooter:
+            return ghost_impact_position(last_impact)
     return None
 
 

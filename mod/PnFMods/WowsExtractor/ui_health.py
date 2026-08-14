@@ -61,20 +61,20 @@ def normalize_ui_health(value, maximum, is_alive):
 
     Unbound treats value==0 while still alive as "bar not yet ticked" and
     draws a full bar. Copying raw 0 would mark the ship dead in the collector.
+    That sentinel is marked ``untickedFull`` so unspotted (灭点) rows can
+    refuse it: a dark bar sitting at 0 is not full HP.
     """
     alive = _is_alive_flag(is_alive)
     max_hp = _as_number(maximum)
     cur = _as_number(value)
     if alive is False:
-        if max_hp is None and cur is None:
-            return None
-        return {"health": 0, "maxHealth": max_hp}
+        return {"health": 0, "maxHealth": max_hp, "alive": False}
     if max_hp is None and cur is None:
         return None
     if alive is True and (cur is None or cur <= 0):
         if max_hp is None or max_hp <= 0:
             return None
-        return {"health": max_hp, "maxHealth": max_hp}
+        return {"health": max_hp, "maxHealth": max_hp, "untickedFull": True}
     if cur is None:
         return None if max_hp is None else {"health": None, "maxHealth": max_hp}
     rec = {"health": cur}
@@ -116,8 +116,13 @@ def index_avatar_health(entities, cc):
     return index
 
 
-def apply_ui_health(entry, index):
-    """Fill missing health / maxHealth on a ship or self dict. Returns entry."""
+def apply_ui_health(entry, index, for_unspotted=False):
+    """Fill missing health / maxHealth on a ship or self dict. Returns entry.
+
+    ``for_unspotted``: last-seen / 灭点 rows. Do not copy the Unbound
+    "value==0 means full bar" sentinel, and let UI ``isAlive=False``
+    overwrite a ghost that was still flagged alive.
+    """
     if not isinstance(entry, dict) or not index:
         return entry
     rec = None
@@ -130,7 +135,12 @@ def apply_ui_health(entry, index):
             break
     if rec is None:
         return entry
-    if entry.get("health") is None and rec.get("health") is not None:
+    if rec.get("alive") is False:
+        entry["alive"] = False
+    copy_health = rec.get("health") is not None
+    if for_unspotted and rec.get("untickedFull"):
+        copy_health = False
+    if entry.get("health") is None and copy_health:
         entry["health"] = rec["health"]
     if entry.get("maxHealth") is None and rec.get("maxHealth") is not None:
         entry["maxHealth"] = rec["maxHealth"]
