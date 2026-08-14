@@ -56,6 +56,11 @@ try:
 except:
     from emit_guard import should_write_state
 
+try:
+    from .ui_health import apply_ui_health, index_avatar_health
+except:
+    from ui_health import apply_ui_health, index_avatar_health
+
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
 
@@ -1116,21 +1121,29 @@ class Collector(object):
     # -- state (per frame) --------------------------------------------------
     def _build_state(self, now):
         self._selfTeam = _UNSET   # recompute self team once for this frame
-        ships, diag = self._build_ships(now)
+        ui_hp = self._collect_avatar_health()
+        ships, diag = self._build_ships(now, ui_hp)
         return {
             'schema': SCHEMA_VERSION,
             'apiVersion': WIRE_API_VERSION,
             'battleId': self._battleId,
             'active': bool(self._active),
             'ts': now,
-            'self': self._build_self(),
+            'self': self._build_self(ui_hp),
             'ships': ships,
             'damage': self._damage.snapshot(),
             'ballistics': _try(lambda: self._ballistics.snapshot(), {'available': False}),
             'diag': diag,
         }
 
-    def _build_self(self):
+    def _collect_avatar_health(self):
+        """Live HP from the same dataHub `health` component TTaroTeamPanel binds."""
+        if CC is None:
+            return {}
+        entities = _try(lambda: dataHub.getEntityCollections('avatar'), []) or []
+        return index_avatar_health(entities, CC)
+
+    def _build_self(self, ui_hp=None):
         info = _try(lambda: battle.getSelfPlayerInfo())
         data = {}
         if info is not None:
@@ -1155,6 +1168,7 @@ class Collector(object):
                     if v is not None:
                         data[k] = v
         data['isObserver'] = _try(lambda: battle.isObserverMode(), False)
+        apply_ui_health(data, ui_hp)
         return data if data else None
 
     def _ship_key(self, entry):
@@ -1402,7 +1416,7 @@ class Collector(object):
             return [ax * mx + bx, 0.0, az * my + bz]
         return [ax * my + bx, 0.0, az * mx + bz]
 
-    def _build_ships(self, now):
+    def _build_ships(self, now, ui_hp=None):
         ships = _try(lambda: battle.getAllShips(), []) or []
         mapIndex = self._collect_map_positions()   # playerId -> (mapX, mapY, mapYaw)
 
@@ -1477,6 +1491,9 @@ class Collector(object):
                 v = _get(ship, k)
                 if v is not None:
                     entry[k] = v
+            # 3D ship.health is empty on some builds; fill from dataHub avatar
+            # health (the component TTaroTeamPanel's side bars already use).
+            apply_ui_health(entry, ui_hp)
             # spotted-only enemies have no ship.yaw; fall back to mapPosition yaw
             if entry.get('yaw') is None and mp is not None and mp[2] is not None:
                 entry['yaw'] = mp[2]
@@ -1562,8 +1579,13 @@ class Collector(object):
             ghost['alive'] = True
             ghost['visible'] = False
             self._apply_ghost(ghost, seen, now)
+            apply_ui_health(ghost, ui_hp)
             out.append(ghost)
             nGhost += 1
+        nHp = 0
+        for row in out:
+            if row.get('maxHealth') is not None:
+                nHp += 1
         return out, {
             'totalShips': len(ships),
             'allies': nAlly,
@@ -1573,6 +1595,7 @@ class Collector(object):
             'ghosts': nGhost,
             'mapCalib': (self._mapTransform[0] if self._mapTransform else None),
             'mapSamples': len(calib),
+            'uiHealth': nHp,
         }
 
 
