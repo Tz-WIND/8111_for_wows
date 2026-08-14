@@ -62,9 +62,13 @@ except:
     from ui_health import apply_ui_health, index_avatar_health
 
 try:
-    from .damage_tracker import DamageTracker, roster_ids_from_avatar
+    from .damage_tracker import (
+        DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
+        extract_vehicle_id)
 except:
-    from damage_tracker import DamageTracker, roster_ids_from_avatar
+    from damage_tracker import (
+        DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
+        extract_vehicle_id)
 
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
@@ -874,14 +878,44 @@ class Collector(object):
                 self._damage.remember(rec[0], rec[1], rec[2])
 
     def _on_damages(self, victimId, damages):
-        _try(lambda: self._damage.on_damages(victimId, damages))
+        fallback = None
+        if extract_vehicle_id(victimId) is None:
+            fallback = self._ghost_victim_fallback()
+        _try(lambda: self._damage.on_damages(
+            victimId, damages, fallback_victim=fallback))
 
     def _on_shell_info(self, victimId, shooterId, ammoId=None, matId=None,
-                       shotId=None, booleans=None, damage=0, *args):
+                       shotId=None, booleans=None, damage=0, shotPosition=None,
+                       *args):
         # Per-shell confirmation of our (and nearby) hits. Fills in a main
         # battery salvo when onReceiveDamagesOnShip keeps only the
         # simultaneous secondary packet for a different target.
-        _try(lambda: self._damage.on_shell(victimId, shooterId, damage))
+        # When the victim is 灭点, victimId is often 0 -- match the impact
+        # against last-seen ghosts so the salvo still counts.
+        fallback = None
+        if extract_vehicle_id(victimId) is None:
+            fallback = self._ghost_victim_fallback(shotPosition)
+        _try(lambda: self._damage.on_shell(
+            victimId, shooterId, damage, fallback_victim=fallback))
+
+    def _ghost_victim_fallback(self, shot_position=None):
+        """Vehicle id of a last-seen (灭点) enemy, or None.
+
+        Used when ModsAPI omits the victim on a hit against an unspotted
+        ship. Remember the ghost's ids so DamageTracker can resolve them.
+        """
+        entries = []
+        try:
+            entries = list(self._lastSeen.values())
+        except Exception:
+            return None
+        for seen in entries:
+            ident = (seen or {}).get('identity') or {}
+            vid = ident.get('vehicleId')
+            pid = ident.get('playerId')
+            if vid is not None and pid is not None:
+                self._damage.remember(vid, pid, ident.get('teamId'))
+        return guess_ghost_victim(entries, shot_position)
 
     # -- state output -------------------------------------------------------
     def _write_state(self, snap):

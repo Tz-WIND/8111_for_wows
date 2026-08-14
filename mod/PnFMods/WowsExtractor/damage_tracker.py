@@ -16,7 +16,20 @@ also drop one of the two vehicle packets. Freeze the packet before any
 lookup, and merge shell info so a lost main-battery salvo still counts.
 Later fire/flood on that target is added on top of the fill, not
 swallowed by max().
+
+A third failure mode: the victim is currently unspotted (灭点 -- last
+seen on the minimap, still alive). `onReceiveDamagesOnShip` often never
+fires because the Vehicle entity is not loaded, and `onReceiveShellInfo`
+arrives with victimId 0 / -1. Dropping that packet is how dark-target
+salvos vanish from the running total even though the in-game ribbon
+moved. Count the shell against the shooter anyway, and attribute the
+victim from a last-seen ghost when we can.
 """
+
+# ModsAPI sentinel: victim/shooter id when the ship is not currently
+# loaded (灭点, scenario structures, etc.). Not a real vehicle id.
+UNKNOWN_VICTIM = 0
+GHOST_MATCH_MAX_DIST = 2500.0
 
 
 def _get_field(obj, *names):
@@ -57,15 +70,19 @@ def extract_vehicle_id(value):
     ModsAPI usually passes a raw int. After a kill it may instead pass the
     leftover vehicle entity (``.id``) or we may have cached a PlayerInfo
     (``.shipId`` is the vehicle, ``.id`` is the player -- do not confuse).
+    0 / -1 are sentinels for "not currently loaded" (灭点), not ids.
     """
     vid = _as_id(value)
     if vid is not None:
-        return vid
+        return vid if vid > 0 else None
     ship = _get_field(value, 'shipId', 'vehicleId', 'vehicleID')
     vid = _as_id(ship)
     if vid is not None:
-        return vid
-    return _as_id(_get_field(value, 'id', '_Ship__id'))
+        return vid if vid > 0 else None
+    vid = _as_id(_get_field(value, 'id', '_Ship__id'))
+    if vid is not None:
+        return vid if vid > 0 else None
+    return None
 
 
 def extract_attacker_vehicle_id(entry):
@@ -144,6 +161,79 @@ def merge_ship_and_shell(ship, shell):
     return ship + shell
 
 
+def _xz(pos):
+    """Horizontal (x, z) from a Vector3, [x,y,z] list, or None."""
+    if pos is None:
+        return None
+    try:
+        x = float(pos[0])
+        z = float(pos[2]) if len(pos) > 2 else float(pos[1])
+        return (x, z)
+    except Exception:
+        pass
+    try:
+        return (float(pos.x), float(pos.z))
+    except Exception:
+        return None
+
+
+def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
+    """Pick a last-seen (灭点) enemy as the shell victim when ModsAPI omits the id.
+
+    ``last_seen_entries`` is an iterable of collector last-seen records:
+    ``{identity: {vehicleId, relation, ...}, pos: [x,y,z]}``. Allies
+    (relation==1) are ignored. With a shot impact, the nearest enemy
+    within ``max_dist`` metres wins; without one, a single remaining
+    enemy ghost is used.
+    """
+    if max_dist is None:
+        max_dist = GHOST_MATCH_MAX_DIST
+    enemies = []
+    for seen in last_seen_entries or []:
+        ident = None
+        pos = None
+        if isinstance(seen, dict):
+            ident = seen.get('identity') or seen
+            pos = seen.get('pos')
+        if not isinstance(ident, dict):
+            continue
+        if ident.get('relation') == 1:
+            continue
+        vid = extract_vehicle_id(ident.get('vehicleId'))
+        if vid is None:
+            vid = extract_vehicle_id(ident.get('vehicleID'))
+        if vid is None:
+            continue
+        enemies.append((vid, pos))
+    if not enemies:
+        return None
+    shot = _xz(shot_position)
+    if shot is None:
+        if len(enemies) == 1:
+            return enemies[0][0]
+        return None
+    best = None
+    best_d = None
+    max_d2 = max_dist * max_dist
+    for vid, pos in enemies:
+        xz = _xz(pos)
+        if xz is None:
+            continue
+        dx = xz[0] - shot[0]
+        dz = xz[1] - shot[1]
+        d2 = dx * dx + dz * dz
+        if d2 > max_d2:
+            continue
+        if best_d is None or d2 < best_d:
+            best_d = d2
+            best = vid
+    if best is not None:
+        return best
+    if len(enemies) == 1:
+        return enemies[0][0]
+    return None
+
+
 def freeze_damage_packet(victim_vehicle_id, damages):
     """Copy victim id + damage primitives before any live lookup.
 
@@ -218,6 +308,10 @@ class DamageTracker(object):
         cached = self._vehicles.get(vid)
         if cached is not None:
             return cached
+        # Some callbacks pass playerId where a vehicleId is expected.
+        for rec in self._vehicles.values():
+            if rec[0] == vid:
+                return rec
         resolver = resolve if resolve is not None else self._resolve
         if resolver is None:
             return None
@@ -232,9 +326,18 @@ class DamageTracker(object):
         cached = self._vehicles.get(vid)
         return cached
 
-    def on_damages(self, victim_vehicle_id, damages, resolve=None):
+    def _resolve_victim(self, victim_vehicle_id, resolve=None, fallback_victim=None):
+        victim = self.lookup(victim_vehicle_id, resolve)
+        if victim is not None:
+            return victim
+        if fallback_victim is None:
+            return None
+        return self.lookup(fallback_victim, resolve)
+
+    def on_damages(self, victim_vehicle_id, damages, resolve=None,
+                   fallback_victim=None):
         victim_vid, frozen = freeze_damage_packet(victim_vehicle_id, damages)
-        victim = self.lookup(victim_vid, resolve)
+        victim = self._resolve_victim(victim_vid, resolve, fallback_victim)
         if victim is None:
             return
         victim_id = victim[0]
@@ -260,23 +363,28 @@ class DamageTracker(object):
                 self._teamTotal[team_id] = self._teamTotal.get(team_id, 0) + dmg
                 self._player_team[attacker_id] = team_id
 
-    def on_shell(self, victim_vehicle_id, shooter_vehicle_id, damage, resolve=None):
+    def on_shell(self, victim_vehicle_id, shooter_vehicle_id, damage,
+                 resolve=None, fallback_victim=None):
         """Per-shell hit from onReceiveShellInfo (own shots, both guns).
 
         Used as a second ledger so a main-battery salvo is not lost when
         the vehicle HP callback keeps only the simultaneous secondary
         packet. snapshot() fills the hole from shells, then adds later
         ship-packet DoT instead of taking max() of the two running totals.
+
+        When the victim is currently unspotted, ModsAPI often passes
+        victimId 0. Count the shell against the shooter anyway; pass
+        ``fallback_victim`` (a last-seen ghost id) to name the target.
         """
         dmg = extract_damage({'damage': damage})
         if dmg is None:
             return
-        victim = self.lookup(victim_vehicle_id, resolve)
         attacker = self.lookup(shooter_vehicle_id, resolve)
-        if victim is None or attacker is None:
+        if attacker is None:
             return
+        victim = self._resolve_victim(victim_vehicle_id, resolve, fallback_victim)
         attacker_id, team_id = attacker
-        victim_id = victim[0]
+        victim_id = victim[0] if victim is not None else UNKNOWN_VICTIM
         bucket = self._shell_inflicted.setdefault(attacker_id, {})
         bucket[victim_id] = bucket.get(victim_id, 0) + dmg
         if team_id is not None:
@@ -306,9 +414,28 @@ class DamageTracker(object):
                 shell_map[key] = dmg
                 keys.add(key)
         pairs = {}
+        unknown_by_attacker = {}
         for key in keys:
+            aid, vid = key
+            if vid == UNKNOWN_VICTIM:
+                unknown_by_attacker[aid] = (
+                    unknown_by_attacker.get(aid, 0) + shell_map.get(key, 0))
+                continue
             pairs[key] = merge_ship_and_shell(
                 ship_map.get(key, 0), shell_map.get(key, 0))
+        # 灭点 shells (victimId=0) later named by an HP packet: if the ship
+        # ledger already has at least that much, the unknown fill is the
+        # same salvo -- drop it. Otherwise keep it as unattributed extra.
+        for aid, unknown in unknown_by_attacker.items():
+            if not unknown:
+                continue
+            identified_ship = 0
+            for (a, _v), dmg in ship_map.items():
+                if a == aid:
+                    identified_ship += dmg
+            if identified_ship >= unknown:
+                continue
+            pairs[(aid, UNKNOWN_VICTIM)] = unknown
         return pairs
 
     def snapshot(self):
@@ -321,13 +448,15 @@ class DamageTracker(object):
         for (aid, vid), dmg in self._merged_pairs().items():
             inf = inflicted.setdefault(aid, {'total': 0, 'byVictim': {}})
             inf['total'] += dmg
+            team = self._team_for_player(aid)
+            if team is not None:
+                team_total[team] = team_total.get(team, 0) + dmg
+            if vid == UNKNOWN_VICTIM:
+                continue
             inf['byVictim'][vid] = inf['byVictim'].get(vid, 0) + dmg
             rec = received.setdefault(vid, {'total': 0, 'byAttacker': {}})
             rec['total'] += dmg
             rec['byAttacker'][aid] = rec['byAttacker'].get(aid, 0) + dmg
-            team = self._team_for_player(aid)
-            if team is not None:
-                team_total[team] = team_total.get(team, 0) + dmg
         out_inf = {}
         for aid, info in inflicted.items():
             out_inf[str(aid)] = {

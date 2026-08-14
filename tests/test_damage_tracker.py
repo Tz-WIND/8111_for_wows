@@ -244,3 +244,139 @@ def test_roster_ids_from_avatar_never_use_avatar_id_as_player_id():
         _Avatar(None, 268369920), _Vehicle(77)) is None
     assert D.roster_ids_from_avatar(
         _Avatar(901, 268369920), _Vehicle(77)) == (77, 901, 1)
+
+
+def test_sentinel_vehicle_ids_are_not_real_entities():
+    """ModsAPI uses 0 / -1 when the victim is currently unspotted (灭点)."""
+    assert D.extract_vehicle_id(0) is None
+    assert D.extract_vehicle_id(-1) is None
+    assert D.extract_vehicle_id({'vehicleId': 0}) is None
+
+
+def test_shell_hit_on_unspotted_victim_still_counts_with_fallback():
+    """Hitting a 灭点: onReceiveShellInfo fires with victimId=0, but the
+    last-seen ghost still tells us who we shot. That damage must land in
+    the running total -- otherwise every dark-target salvo is silently
+    dropped even though the in-game ribbon and damage counter move."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_shell(0, 1, 18400, fallback_victim=77)
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 18400
+    assert snap['inflicted']['537']['byVictim']['901'] == 18400
+    assert snap['received']['901']['total'] == 18400
+    assert snap['teamTotal']['0'] == 18400
+
+
+def test_shell_hit_on_unspotted_victim_counts_total_without_fallback():
+    """Even if we cannot name the dark target, the shooter's inflicted
+    total (and team total) must still move. byVictim/received stay empty
+    rather than inventing a ship."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_shell(0, 1, 4200)
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 4200
+    assert snap['inflicted']['537']['byVictim'] == {}
+    assert snap['received'] == {}
+    assert snap['teamTotal']['0'] == 4200
+
+
+def test_unspotted_shell_then_identified_ship_packet_does_not_double_count():
+    """Same salvo: shell info arrives with victimId=0, then the ship HP
+    packet names the victim. The unknown shell fill must be consumed, not
+    added on top of the identified ship total."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_shell(0, 1, 18400)
+    tracker.on_damages(77, [{'vehicleID': 1, 'damage': 18400}])
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 18400
+    assert snap['inflicted']['537']['byVictim']['901'] == 18400
+
+
+def test_unspotted_shell_plus_later_dot_on_named_victim_adds_dot():
+    """灭点 salvo attributed via last-seen fallback, then fire ticks after
+    they light up: same merge as a spotted shell fill + later DoT."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_shell(0, 1, 18400, fallback_victim=77)
+    tracker.on_damages(77, [{'vehicleID': 1, 'damage': 3000}])
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['byVictim']['901'] == 21400
+    assert snap['inflicted']['537']['total'] == 21400
+
+
+def test_unattributed_shell_and_later_dot_keep_both_in_total():
+    """Without a ghost match, the dark salvo still sits in the shooter
+    total; a later named DoT packet is extra, not a replacement."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_shell(0, 1, 18400)
+    tracker.on_damages(77, [{'vehicleID': 1, 'damage': 3000}])
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 21400
+    assert snap['inflicted']['537']['byVictim']['901'] == 3000
+
+
+def test_damages_packet_with_sentinel_victim_uses_fallback():
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_damages(0, [{'vehicleID': 1, 'damage': 8800}], fallback_victim=77)
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 8800
+    assert snap['received']['901']['total'] == 8800
+
+
+def test_guess_ghost_victim_picks_nearest_enemy_last_seen():
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'playerId': 901, 'relation': 2},
+         'pos': [100.0, 0.0, 100.0]},
+        {'identity': {'vehicleId': 88, 'playerId': 902, 'relation': 2},
+         'pos': [800.0, 0.0, 800.0]},
+        {'identity': {'vehicleId': 11, 'playerId': 537, 'relation': 1},
+         'pos': [101.0, 0.0, 101.0]},
+    ]
+    assert D.guess_ghost_victim(ghosts, [110.0, 0.0, 90.0]) == 77
+
+
+def test_guess_ghost_victim_uses_the_only_enemy_ghost_without_shot_pos():
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'playerId': 901, 'relation': 2},
+         'pos': [100.0, 0.0, 100.0]},
+        {'identity': {'vehicleId': 11, 'playerId': 537, 'relation': 1},
+         'pos': [0.0, 0.0, 0.0]},
+    ]
+    assert D.guess_ghost_victim(ghosts, None) == 77
+
+
+def test_guess_ghost_victim_stays_none_when_several_ghosts_and_no_shot():
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'relation': 2}, 'pos': [0.0, 0.0, 0.0]},
+        {'identity': {'vehicleId': 88, 'relation': 2}, 'pos': [50.0, 0.0, 0.0]},
+    ]
+    assert D.guess_ghost_victim(ghosts, None) is None
+
+
+def test_lookup_accepts_cached_player_id_as_alias():
+    """Some callbacks pass playerId where a vehicleId is expected."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    assert tracker.lookup(901) == (901, 1)
