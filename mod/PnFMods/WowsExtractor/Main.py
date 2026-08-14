@@ -61,6 +61,11 @@ try:
 except:
     from ui_health import apply_ui_health, index_avatar_health
 
+try:
+    from .damage_tracker import DamageTracker, roster_ids_from_avatar
+except:
+    from damage_tracker import DamageTracker, roster_ids_from_avatar
+
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
 
@@ -552,68 +557,6 @@ def _looks_like_space(v):
 
 
 # ===========================================================================
-# damage accumulation (mirrors DamageMonitor approach)
-# ===========================================================================
-class DamageTracker(object):
-    def __init__(self):
-        self.clear()
-
-    def clear(self):
-        self._inflicted = {}   # attackerPlayerId -> {'total':x, 'byVictim':{vid:dmg}}
-        self._received = {}    # victimPlayerId   -> {'total':x, 'byAttacker':{aid:dmg}}
-        self._teamTotal = {}   # teamId -> total
-
-    def on_damages(self, victimVehicleId, damages):
-        victim = _try(lambda: battle.getPlayerByVehicleId(victimVehicleId))
-        if victim is None:
-            return
-        victimId = _try(lambda: victim.id)
-        if victimId is None:
-            return
-        for d in (damages or []):
-            dmg = _try(lambda: d['damage'], 0) or 0
-            if dmg <= 0:
-                continue
-            attacker = _try(lambda: battle.getPlayerByVehicleId(d['vehicleID']))
-            if attacker is None:
-                continue
-            attackerId = _try(lambda: attacker.id)
-            teamId = _try(lambda: attacker.teamId)
-            if attackerId is None:
-                continue
-            inf = self._inflicted.setdefault(attackerId, {'total': 0, 'byVictim': {}})
-            inf['total'] += dmg
-            inf['byVictim'][victimId] = inf['byVictim'].get(victimId, 0) + dmg
-            rec = self._received.setdefault(victimId, {'total': 0, 'byAttacker': {}})
-            rec['total'] += dmg
-            rec['byAttacker'][attackerId] = rec['byAttacker'].get(attackerId, 0) + dmg
-            if teamId is not None:
-                self._teamTotal[teamId] = self._teamTotal.get(teamId, 0) + dmg
-
-    def snapshot(self):
-        # stringify int keys so they survive JSON object keys cleanly
-        def keymap(d):
-            return dict((str(k), v) for k, v in d.items())
-        inflicted = {}
-        for aid, info in self._inflicted.items():
-            inflicted[str(aid)] = {
-                'total': info['total'],
-                'byVictim': keymap(info['byVictim']),
-            }
-        received = {}
-        for vid, info in self._received.items():
-            received[str(vid)] = {
-                'total': info['total'],
-                'byAttacker': keymap(info['byAttacker']),
-            }
-        return {
-            'inflicted': inflicted,
-            'received': received,
-            'teamTotal': keymap(self._teamTotal),
-        }
-
-
-# ===========================================================================
 # ballistics tracker (best-effort; mirrors PenetrationCalculator)
 # ===========================================================================
 class BallisticsTracker(object):
@@ -737,7 +680,7 @@ class Collector(object):
         self._metaRetryUntil = 0.0
         self._metaReady = False
         self._load_config()
-        self._damage = DamageTracker()
+        self._damage = DamageTracker(resolve=self._live_vehicle_player)
         self._ballistics = BallisticsTracker()
         # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
         # have seen, so enemies that lit up then went dark keep a "ghost" marker.
@@ -763,6 +706,7 @@ class Collector(object):
         events.onBattleShown(self._on_battle_shown)
         events.onBattleQuit(self._on_battle_quit)
         events.onReceiveDamagesOnShip(self._on_damages)
+        _try(lambda: events.onReceiveShellInfo(self._on_shell_info))
         # ballistics (best effort; some builds may not expose all of these)
         _try(lambda: events.onArtilleryAmmoChanged(self._ballistics.on_ammo_changed))
         _try(lambda: events.onWeaponTypeChanged(self._ballistics.on_weapon_changed))
@@ -804,6 +748,8 @@ class Collector(object):
         self._metaRetryUntil = 0.0
         self._metaReady = False
         self._selfPlayerId = _try(lambda: battle.getSelfPlayerInfo().id)
+        self._remember_player_vehicle(_try(lambda: battle.getSelfPlayerInfo()))
+        self._remember_roster_vehicles()
         self._battleId = self._battleIdentity.start(
             self._selfPlayerId, self._find_arena_id())
 
@@ -832,6 +778,7 @@ class Collector(object):
         self._active = True
         self._ballistics.start()
         self._metaRetryUntil = _now() + META_RETRY_SECONDS
+        self._remember_roster_vehicles()
         self._refresh_meta(force=True)
         # start the high-frequency state loop
         self._stop_tick()
@@ -851,7 +798,8 @@ class Collector(object):
         try:
             snap = {'schema': SCHEMA_VERSION, 'apiVersion': WIRE_API_VERSION,
                     'battleId': self._battleId, 'active': False, 'ts': _now(),
-                    'ships': [], 'self': None}
+                    'ships': [], 'self': None,
+                    'damage': self._damage.snapshot()}
             self._write_state(snap)
         except:
             pass
@@ -861,8 +809,79 @@ class Collector(object):
             _try(lambda: callbacks.cancel(self._tickHandle))
             self._tickHandle = None
 
+    def _live_vehicle_player(self, vehicle_id):
+        """Live ModsAPI lookup. Returns (playerId, teamId) or None.
+
+        Unreliable on a killing blow -- the vehicle is often already gone --
+        which is why DamageTracker consults its roster cache first.
+        """
+        player = _try(lambda: battle.getPlayerByVehicleId(vehicle_id))
+        if player is None:
+            return None
+        pid = _get(player, 'id')
+        if pid is None and _is_mapping(player):
+            pid = _try(lambda: player['id'])
+        if pid is None:
+            return None
+        team = _get(player, 'teamId')
+        if team is None and _is_mapping(player):
+            team = _try(lambda: player['teamId'])
+        return (pid, team)
+
+    def _remember_player_vehicle(self, player, vehicle_id=None, team_id=None):
+        if player is not None and self._damage.remember_player(player):
+            return
+        pid = _get(player, 'id') if player is not None else None
+        if pid is None and player is not None and _is_mapping(player):
+            pid = _try(lambda: player['id'])
+        if vehicle_id is None and player is not None:
+            vehicle_id = _get(player, 'shipId')
+            if vehicle_id is None and _is_mapping(player):
+                vehicle_id = _try(lambda: player['shipId'])
+        if team_id is None and player is not None:
+            team_id = _get(player, 'teamId')
+            if team_id is None and _is_mapping(player):
+                team_id = _try(lambda: player['teamId'])
+        if vehicle_id is not None and pid is not None:
+            self._damage.remember(vehicle_id, pid, team_id)
+
+    def _remember_roster_vehicles(self):
+        """Cache vehicleId -> playerId for the whole roster, including ships
+        that are already dead or were never in getAllShips() this tick.
+
+        PlayerInfo.shipId survives destruction; getPlayerByVehicleId does not.
+        """
+        players = _try(lambda: battle.getPlayersInfo())
+        if players is None:
+            players = _try(lambda: battle.getPlayers())
+        if players is not None:
+            items = players
+            if _is_mapping(players):
+                items = _try(lambda: list(players.values()), []) or []
+            for player in items or []:
+                self._remember_player_vehicle(player)
+        if CC is None:
+            return
+        av_key = _get(CC, 'avatar')
+        veh_key = _get(CC, 'vehicle')
+        if av_key is None:
+            return
+        for entity in _try(lambda: dataHub.getEntityCollections('avatar'), []) or []:
+            avatar = _try(lambda e=entity, k=av_key: e[k])
+            vehicle = _try(lambda e=entity, k=veh_key: e[k]) if veh_key is not None else None
+            rec = roster_ids_from_avatar(avatar, vehicle)
+            if rec is not None:
+                self._damage.remember(rec[0], rec[1], rec[2])
+
     def _on_damages(self, victimId, damages):
         _try(lambda: self._damage.on_damages(victimId, damages))
+
+    def _on_shell_info(self, victimId, shooterId, ammoId=None, matId=None,
+                       shotId=None, booleans=None, damage=0, *args):
+        # Per-shell confirmation of our (and nearby) hits. Fills in a main
+        # battery salvo when onReceiveDamagesOnShip keeps only the
+        # simultaneous secondary packet for a different target.
+        _try(lambda: self._damage.on_shell(victimId, shooterId, damage))
 
     # -- state output -------------------------------------------------------
     def _write_state(self, snap):
@@ -1121,6 +1140,7 @@ class Collector(object):
     # -- state (per frame) --------------------------------------------------
     def _build_state(self, now):
         self._selfTeam = _UNSET   # recompute self team once for this frame
+        self._remember_roster_vehicles()
         ui_hp = self._collect_avatar_health()
         ships, diag = self._build_ships(now, ui_hp)
         return {
@@ -1431,6 +1451,9 @@ class Collector(object):
                     break
             player = _try(lambda: battle.getPlayerByVehicleId(vehId)) if vehId is not None else None
             pid = _get(player, 'id') if player is not None else None
+            if vehId is not None and pid is not None:
+                self._damage.remember(
+                    vehId, pid, _get(player, 'teamId') or _get(ship, 'teamId'))
             worldPos = self._get_ship_position(ship, pid, vehId)
             infos.append((ship, vehId, player, pid, worldPos))
             if worldPos and pid is not None:
