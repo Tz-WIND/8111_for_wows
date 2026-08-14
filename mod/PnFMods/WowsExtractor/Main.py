@@ -62,9 +62,13 @@ except:
     from ui_health import apply_ui_health, index_avatar_health
 
 try:
-    from .damage_tracker import DamageTracker, roster_ids_from_avatar
+    from .damage_tracker import (
+        DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
+        extract_vehicle_id, dark_last_seen_entries)
 except:
-    from damage_tracker import DamageTracker, roster_ids_from_avatar
+    from damage_tracker import (
+        DamageTracker, roster_ids_from_avatar, guess_ghost_victim,
+        extract_vehicle_id, dark_last_seen_entries)
 
 # One nonce per game/mod load prevents fallback IDs repeating after a restart.
 SESSION_NONCE = create_session_nonce()
@@ -685,6 +689,9 @@ class Collector(object):
         # key -> {identity{...}, pos, yaw, health, ts}; last spot of each ship we
         # have seen, so enemies that lit up then went dark keep a "ghost" marker.
         self._lastSeen = {}
+        # v/u/p aliases of ships that had a live position on the last tick.
+        # last-seen also keeps spotted ships; ghost matching must skip these.
+        self._visibleShipKeys = set()
         # Ships observed dead this battle. Prevents a sunk enemy that drops out of
         # getAllShips() from being resurrected as a last-seen ("灭点") ghost.
         self._deadKeys = set()
@@ -742,6 +749,7 @@ class Collector(object):
         self._resolve_paths()
         self._damage.clear()
         self._lastSeen = {}
+        self._visibleShipKeys = set()
         self._deadKeys = set()
         self._mapTransform = None
         self._lastMetaWrite = 0.0
@@ -791,6 +799,7 @@ class Collector(object):
         self._stop_tick()
         self._ballistics.stop()
         self._lastSeen = {}
+        self._visibleShipKeys = set()
         self._deadKeys = set()
         self._mapTransform = None
         # write one final snapshot marking the battle inactive (through the same
@@ -874,14 +883,48 @@ class Collector(object):
                 self._damage.remember(rec[0], rec[1], rec[2])
 
     def _on_damages(self, victimId, damages):
-        _try(lambda: self._damage.on_damages(victimId, damages))
+        fallback = None
+        if extract_vehicle_id(victimId) is None:
+            fallback = self._ghost_victim_fallback()
+        _try(lambda: self._damage.on_damages(
+            victimId, damages, fallback_victim=fallback))
 
     def _on_shell_info(self, victimId, shooterId, ammoId=None, matId=None,
-                       shotId=None, booleans=None, damage=0, *args):
+                       shotId=None, booleans=None, damage=0, shotPosition=None,
+                       *args):
         # Per-shell confirmation of our (and nearby) hits. Fills in a main
         # battery salvo when onReceiveDamagesOnShip keeps only the
         # simultaneous secondary packet for a different target.
-        _try(lambda: self._damage.on_shell(victimId, shooterId, damage))
+        # When the victim is 灭点, victimId is often 0 -- match the impact
+        # against last-seen ghosts so the salvo still counts.
+        fallback = None
+        if extract_vehicle_id(victimId) is None:
+            fallback = self._ghost_victim_fallback(shotPosition)
+        _try(lambda: self._damage.on_shell(
+            victimId, shooterId, damage, fallback_victim=fallback))
+
+    def _ghost_victim_fallback(self, shot_position=None):
+        """Vehicle id of a last-seen (灭点) enemy, or None.
+
+        Used when ModsAPI omits the victim on a hit against an unspotted
+        ship. Remember the ghost's ids so DamageTracker can resolve them.
+        Only currently-dark last-seen rows are eligible; spotted ships stay
+        in _lastSeen for TTL but must not steal the match.
+        """
+        try:
+            all_seen = self._lastSeen
+            seen_rows = list(all_seen.values())
+            visible = self._visibleShipKeys
+        except Exception:
+            return None
+        for seen in seen_rows:
+            ident = (seen or {}).get('identity') or {}
+            vid = ident.get('vehicleId')
+            pid = ident.get('playerId')
+            if vid is not None and pid is not None:
+                self._damage.remember(vid, pid, ident.get('teamId'))
+        dark = dark_last_seen_entries(all_seen, visible)
+        return guess_ghost_victim(dark, shot_position)
 
     # -- state output -------------------------------------------------------
     def _write_state(self, snap):
@@ -1471,6 +1514,7 @@ class Collector(object):
         # -- pass 2: build per-ship entries --------------------------------------
         out = []
         seen_keys = set()
+        visible_keys = set()
         nAlly = 0
         nAllyVis = 0
         nEnemy = 0
@@ -1550,6 +1594,8 @@ class Collector(object):
                 entry['alive'] = False
                 self._forget_ship(entry)
             elif pos or norm is not None:
+                for vis_key in keys:
+                    visible_keys.add(vis_key)
                 if key is not None:
                     self._remember(key, entry, pos, now)
             elif key is not None:
@@ -1605,6 +1651,7 @@ class Collector(object):
             apply_ui_health(ghost, ui_hp)
             out.append(ghost)
             nGhost += 1
+        self._visibleShipKeys = visible_keys
         nHp = 0
         for row in out:
             if row.get('maxHealth') is not None:
