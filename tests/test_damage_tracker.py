@@ -380,3 +380,81 @@ def test_lookup_accepts_cached_player_id_as_alias():
     tracker = _tracker(live=lambda _vid: None)
     tracker.remember(77, 901, 1)
     assert tracker.lookup(901) == (901, 1)
+
+
+def test_prior_spotted_damage_does_not_eat_later_unattributed_dark_shell():
+    """Lifetime HP on a spotted ship must not swallow a later 灭点 salvo
+    that ModsAPI left with victimId=0. Comparing unknown shells to the
+    attacker's whole ship ledger re-drops mid-game dark hits."""
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(88, 902, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_damages(77, [{'vehicleID': 1, 'damage': 20000}])
+    tracker.on_shell(0, 1, 5000)
+
+    snap = tracker.snapshot()
+    assert snap['inflicted']['537']['total'] == 25000
+    assert snap['inflicted']['537']['byVictim']['901'] == 20000
+    assert snap['teamTotal']['0'] == 25000
+
+
+def test_prior_named_salvo_does_not_eat_later_unattributed_dark_shell():
+    tracker = _tracker(live=lambda _vid: None)
+    tracker.remember(77, 901, 1)
+    tracker.remember(1, 537, 0)
+
+    tracker.on_damages(77, [{'vehicleID': 1, 'damage': 20000}])
+    tracker.on_shell(77, 1, 20000)
+    tracker.on_shell(0, 1, 5000)
+
+    assert tracker.snapshot()['inflicted']['537']['total'] == 25000
+
+
+def test_guess_ghost_victim_dedupes_same_ship_under_two_last_seen_keys():
+    """uiId then vehicleId can leave two last-seen rows for one enemy.
+    Without a shot pos that must still count as the only dark target."""
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'uiId': 5, 'relation': 2},
+         'pos': [0.0, 0.0, 0.0]},
+        {'identity': {'vehicleId': 77, 'uiId': 5, 'relation': 2},
+         'pos': [0.0, 0.0, 0.0]},
+    ]
+    assert D.guess_ghost_victim(ghosts, None) == 77
+
+
+def test_dark_last_seen_entries_skip_ships_that_are_currently_spotted():
+    last_seen = {
+        'v77': {'identity': {'vehicleId': 77, 'playerId': 901, 'relation': 2},
+                'pos': [100.0, 0.0, 100.0]},
+        'v88': {'identity': {'vehicleId': 88, 'playerId': 902, 'relation': 2},
+                'pos': [800.0, 0.0, 800.0]},
+    }
+    dark = D.dark_last_seen_entries(last_seen, visible_keys=set(['v77', 'p901']))
+    assert [e['identity']['vehicleId'] for e in dark] == [88]
+
+
+def test_dark_filter_then_guess_does_not_pick_closer_spotted_enemy():
+    """_lastSeen also stores currently lit ships. Nearest-in-2500m among
+    all of them would mis-attribute a 灭点 hit to a spotted neighbour."""
+    last_seen = {
+        'v11': {'identity': {'vehicleId': 11, 'relation': 2},
+                'pos': [100.0, 0.0, 100.0]},
+        'v77': {'identity': {'vehicleId': 77, 'relation': 2},
+                'pos': [400.0, 0.0, 400.0]},
+    }
+    shot = [110.0, 0.0, 90.0]
+    assert D.guess_ghost_victim(list(last_seen.values()), shot) == 11
+    dark = D.dark_last_seen_entries(last_seen, visible_keys=set(['v11']))
+    assert D.guess_ghost_victim(dark, shot) == 77
+
+
+def test_guess_ghost_victim_treats_invalid_shot_position_as_missing():
+    """If ModsAPI argument order is off, yaw/flags must not become a point."""
+    ghosts = [
+        {'identity': {'vehicleId': 77, 'relation': 2}, 'pos': [0.0, 0.0, 0.0]},
+        {'identity': {'vehicleId': 88, 'relation': 2}, 'pos': [50.0, 0.0, 0.0]},
+    ]
+    assert D.guess_ghost_victim(ghosts, 1.57) is None
+    assert D.guess_ghost_victim(ghosts, True) is None

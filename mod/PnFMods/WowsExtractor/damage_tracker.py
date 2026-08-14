@@ -177,18 +177,60 @@ def _xz(pos):
         return None
 
 
+def ship_alias_keys(ident):
+    """Collector last-seen keys for a ship identity (vehicle / ui / player)."""
+    keys = []
+    if not isinstance(ident, dict):
+        return keys
+    for name in ('vehicleId', 'uiId', 'playerId'):
+        value = ident.get(name)
+        if value is not None:
+            keys.append(name[0] + str(value))
+    return keys
+
+
+def dark_last_seen_entries(last_seen, visible_keys=None):
+    """Last-seen records for ships that are not currently spotted.
+
+    ``last_seen`` is the collector map ``key -> {identity, pos, ...}``.
+    ``visible_keys`` are the same v/u/p aliases stamped this frame for
+    ships that still have a live position. Spotted enemies stay in
+    last-seen for TTL reasons and must not be guessed as 灭点 victims.
+    """
+    visible = visible_keys or set()
+    out = []
+    try:
+        items = last_seen.items()
+    except Exception:
+        return out
+    for key, seen in items:
+        ident = (seen or {}).get('identity') or {}
+        aliases = [key]
+        aliases.extend(ship_alias_keys(ident))
+        spotted = False
+        for alias in aliases:
+            if alias in visible:
+                spotted = True
+                break
+        if spotted:
+            continue
+        out.append(seen)
+    return out
+
+
 def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
     """Pick a last-seen (灭点) enemy as the shell victim when ModsAPI omits the id.
 
     ``last_seen_entries`` is an iterable of collector last-seen records:
     ``{identity: {vehicleId, relation, ...}, pos: [x,y,z]}``. Allies
-    (relation==1) are ignored. With a shot impact, the nearest enemy
+    (relation==1) are ignored. Duplicate rows for one vehicle (uiId then
+    vehicleId) count as one ship. With a shot impact, the nearest enemy
     within ``max_dist`` metres wins; without one, a single remaining
-    enemy ghost is used.
+    enemy ghost is used. Invalid shot positions are treated as missing.
     """
     if max_dist is None:
         max_dist = GHOST_MATCH_MAX_DIST
-    enemies = []
+    unique = {}
     for seen in last_seen_entries or []:
         ident = None
         pos = None
@@ -204,6 +246,12 @@ def guess_ghost_victim(last_seen_entries, shot_position=None, max_dist=None):
             vid = extract_vehicle_id(ident.get('vehicleID'))
         if vid is None:
             continue
+        if vid not in unique:
+            unique[vid] = pos
+        elif unique[vid] is None and pos is not None:
+            unique[vid] = pos
+    enemies = []
+    for vid, pos in unique.items():
         enemies.append((vid, pos))
     if not enemies:
         return None
@@ -341,6 +389,7 @@ class DamageTracker(object):
         if victim is None:
             return
         victim_id = victim[0]
+        packet_by_attacker = {}
         for entry in frozen:
             dmg = entry.get('damage')
             if dmg is None:
@@ -362,6 +411,27 @@ class DamageTracker(object):
             if team_id is not None:
                 self._teamTotal[team_id] = self._teamTotal.get(team_id, 0) + dmg
                 self._player_team[attacker_id] = team_id
+            packet_by_attacker[attacker_id] = (
+                packet_by_attacker.get(attacker_id, 0) + dmg)
+        self._consume_unknown_named_by_ship(victim_id, packet_by_attacker)
+
+    def _consume_unknown_named_by_ship(self, victim_id, packet_by_attacker):
+        """Drop victimId=0 shell fill when this HP packet is the same salvo.
+
+        Compare against this packet only, and only if that victim has no
+        named shells. Lifetime spotted HP must not swallow a later dark hit.
+        """
+        for attacker_id, packet_dmg in packet_by_attacker.items():
+            bucket = self._shell_inflicted.get(attacker_id)
+            if not bucket:
+                continue
+            unknown = bucket.get(UNKNOWN_VICTIM)
+            if not unknown:
+                continue
+            if bucket.get(victim_id):
+                continue
+            if packet_dmg >= unknown:
+                bucket.pop(UNKNOWN_VICTIM, None)
 
     def on_shell(self, victim_vehicle_id, shooter_vehicle_id, damage,
                  resolve=None, fallback_victim=None):
@@ -423,19 +493,13 @@ class DamageTracker(object):
                 continue
             pairs[key] = merge_ship_and_shell(
                 ship_map.get(key, 0), shell_map.get(key, 0))
-        # 灭点 shells (victimId=0) later named by an HP packet: if the ship
-        # ledger already has at least that much, the unknown fill is the
-        # same salvo -- drop it. Otherwise keep it as unattributed extra.
+        # Unattributed 灭点 shells stay in the shooter total. Same-salvo
+        # double counting is handled in on_damages when an HP packet names
+        # the victim (see _consume_unknown_named_by_ship), not by comparing
+        # unknown fill to the attacker's lifetime spotted damage.
         for aid, unknown in unknown_by_attacker.items():
-            if not unknown:
-                continue
-            identified_ship = 0
-            for (a, _v), dmg in ship_map.items():
-                if a == aid:
-                    identified_ship += dmg
-            if identified_ship >= unknown:
-                continue
-            pairs[(aid, UNKNOWN_VICTIM)] = unknown
+            if unknown:
+                pairs[(aid, UNKNOWN_VICTIM)] = unknown
         return pairs
 
     def snapshot(self):
